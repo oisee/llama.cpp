@@ -12,6 +12,9 @@ static bool callback(ggml_tensor * t, bool ask, void * user) {
     bool want = std::strstr(t->name, "ffn_moe_") || std::strstr(t->name, "ffn_norm-");
     if (std::strchr(t->name, ' ')) want = false;
     if (std::getenv("TRACE_LONG") && (std::strstr(t->name, "ffn_moe_gate-") || std::strstr(t->name, "ffn_moe_up-") || std::strstr(t->name, "ffn_moe_swiglu-") || std::strstr(t->name, "ffn_moe_down-") || std::strstr(t->name, "ffn_moe_weighted-"))) want = false;
+    if (std::getenv("TRACE_TOKEN_FILE")) {
+        want = std::strstr(t->name, "ffn_moe_topk-") || std::strstr(t->name, "ffn_moe_weights_norm-");
+    }
     if (ask) return want;
     if (!want) return true;
     auto & s = *static_cast<Trace *>(user);
@@ -38,7 +41,8 @@ int main(int argc, char ** argv) {
     if (!model) return 3;
     Trace trace{argv[2], std::ofstream(std::string(argv[2])+"/index.txt")};
     auto cp = llama_context_default_params();
-    cp.n_ctx=512; cp.n_batch=512; cp.n_ubatch=512;
+    const bool full_chunk = std::getenv("TRACE_TOKEN_FILE") != nullptr;
+    cp.n_ctx=full_chunk ? 4096 : 512; cp.n_batch=cp.n_ctx; cp.n_ubatch=cp.n_ctx;
     cp.n_threads=8; cp.n_threads_batch=8;
     cp.offload_kqv=gpu; cp.op_offload=gpu;
     cp.cb_eval=callback; cp.cb_eval_user_data=&trace;
@@ -46,7 +50,15 @@ int main(int argc, char ** argv) {
     if (!ctx) return 4;
     // Fixed teacher-forced token IDs, identical for every model.
     std::vector<llama_token> tokens{42, 14, 159, 26};
-    if (std::getenv("TRACE_LONG")) {
+    if (full_chunk) {
+        std::ifstream in(std::getenv("TRACE_TOKEN_FILE"), std::ios::binary);
+        char header[20];
+        in.read(header, sizeof(header));
+        if (!in || std::memcmp(header, "_logits_", 8) != 0) return 8;
+        tokens.resize(4096);
+        in.read(reinterpret_cast<char *>(tokens.data()), tokens.size() * sizeof(llama_token));
+        if (!in) return 9;
+    } else if (std::getenv("TRACE_LONG")) {
         std::ifstream in("texts/heldout-own-body006.txt");
         std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         auto * v = llama_model_get_vocab(model);
