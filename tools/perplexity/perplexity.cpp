@@ -3,6 +3,9 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "ggml-backend.h"
+#include <cstdlib>
+#include <stdexcept>
 
 #include <algorithm>
 #include <array>
@@ -23,6 +26,28 @@
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+// Optional selected-ID trace: records layer, top_k, token count, then packed I32 IDs.
+static bool cnm_routing_trace(ggml_tensor * t, bool ask, void * user) {
+    int layer = -1;
+    int end = 0;
+    const bool want = std::sscanf(t->name, "ffn_moe_topk-%d%n", &layer, &end) == 1 && t->name[end] == '\0';
+    if (ask) { return want; }
+    if (!want) { return true; }
+    if (t->type != GGML_TYPE_I32 || t->ne[2] != 1 || t->ne[3] != 1) { throw std::runtime_error("unexpected topk shape"); }
+    auto & out = *static_cast<std::ofstream *>(user);
+    const int32_t header[] = {layer, int32_t(t->ne[0]), int32_t(t->ne[1])};
+    out.write(reinterpret_cast<const char *>(header), sizeof(header));
+    std::vector<char> bytes(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
+    for (int64_t token = 0; token < t->ne[1]; ++token) {
+        for (int64_t k = 0; k < t->ne[0]; ++k) {
+            out.write(bytes.data() + token * t->nb[1] + k * t->nb[0], sizeof(int32_t));
+        }
+    }
+    if (!out) { throw std::runtime_error("cannot write CNM_ROUTING_TRACE"); }
+    return true;
+}
 
 struct results_perplexity {
     std::vector<llama_token> tokens;
@@ -2022,6 +2047,14 @@ int llama_perplexity(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    std::ofstream routing_trace;
+    if (const char * path = std::getenv("CNM_ROUTING_TRACE")) {
+        routing_trace.open(path, std::ios::binary);
+        if (!routing_trace) { throw std::runtime_error("cannot open CNM_ROUTING_TRACE"); }
+        params.cb_eval = cnm_routing_trace;
+        params.cb_eval_user_data = &routing_trace;
+    }
 
     // load the model and apply lora adapter, if any
     auto llama_init = common_init_from_params(params);

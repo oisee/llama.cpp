@@ -139,6 +139,99 @@ static void cnm_apply_expert_mask(llama_model_base & model) {
     LLAMA_LOG_INFO("CNM_EXPERT_MASK: canonical sha256 %s\n", hash_sha256_hex(encoded.data(), encoded.size()).c_str());
 }
 
+// Use the mask tensor path so a cold -inf bias has the same graph as a hard mask.
+static void cnm_apply_expert_bias(llama_model_base & model) {
+    const char * path = std::getenv("CNM_EXPERT_BIAS");
+    if (!path) { return; }
+    auto fail = [](const std::string & why) { throw std::runtime_error("CNM_EXPERT_BIAS: " + why); };
+    if (std::getenv("CNM_EXPERT_MASK")) { fail("cannot combine with CNM_EXPERT_MASK"); }
+    if (model.arch != LLM_ARCH_QWEN4EXP || model.hparams.n_expert_groups > 1 || !model.cnm_router_masks.empty()) {
+        fail("requires uncut qwen4exp with ungrouped softmax routing");
+    }
+    using json = nlohmann::ordered_json;
+    std::ifstream input(path);
+    if (!input) { fail("cannot open JSON: " + std::string(path)); }
+    std::vector<std::set<std::string>> keys;
+    auto callback = [&](int, json::parse_event_t event, json & value) {
+        if (event == json::parse_event_t::object_start) { keys.emplace_back(); }
+        if (event == json::parse_event_t::key && !keys.back().insert(value.get<std::string>()).second) { fail("duplicate key"); }
+        if (event == json::parse_event_t::object_end) { keys.pop_back(); }
+        return true;
+    };
+    const json plan = json::parse(input, callback);
+    if (!plan.is_object() || !plan.contains("layers") || !plan["layers"].is_object() || plan["layers"].empty()) {
+        fail("expected {bias: number or \"-inf\", layers: {layer: [cold IDs] or {expert: bias}}}");
+    }
+    for (auto it = plan.begin(); it != plan.end(); ++it) {
+        if (it.key() != "bias" && it.key() != "layers") { fail("unknown field: " + it.key()); }
+    }
+    auto parse_bias = [&](const json & v) -> float {
+        if (v.is_string() && v.get<std::string>() == "-inf") { return -INFINITY; }
+        if (!v.is_number()) { fail("bias must be a nonpositive number or \"-inf\""); }
+        const double d = v.get<double>();
+        const float f = static_cast<float>(d);
+        if (!std::isfinite(d) || !std::isfinite(f) || d > 0) { fail("bias must be finite, representable and nonpositive"); }
+        return f;
+    };
+    const float scalar = plan.contains("bias") ? parse_bias(plan["bias"]) : 0.0f;
+    auto parse_id = [&](const std::string & key, size_t limit) -> int {
+        if (!std::regex_match(key, std::regex("0|[1-9][0-9]*"))) { fail("invalid index: " + key); }
+        unsigned long long id = 0;
+        try { id = std::stoull(key); } catch (...) { fail("index out of range"); }
+        if (id >= limit) { fail("index out of range: " + key); }
+        return int(id);
+    };
+    std::map<int, std::vector<float>> values;
+    for (auto it = plan["layers"].begin(); it != plan["layers"].end(); ++it) {
+        const int il = parse_id(it.key(), model.layers.size());
+        const auto & layer = model.layers[il];
+        if (!layer.ffn_gate_inp || layer.ffn_exp_probs_b || layer.ffn_router_mask || layer.ffn_gate_inp->ne[1] != model.hparams.n_expert(il)) {
+            fail("unsupported router in layer " + it.key());
+        }
+        auto & row = values[il];
+        row.resize(model.hparams.n_expert(il), 0.0f);
+        if (it.value().is_array()) {
+            if (!plan.contains("bias")) { fail("ID arrays require scalar bias"); }
+            std::set<int> seen;
+            for (const auto & e : it.value()) {
+                if (!e.is_number_integer() || e.get<double>() < 0 || e.get<double>() >= row.size()) { fail("invalid expert ID"); }
+                const int id = e.get<int>();
+                if (!seen.insert(id).second) { fail("duplicate expert ID"); }
+                row[id] = scalar;
+            }
+        } else if (it.value().is_object()) {
+            for (auto e = it.value().begin(); e != it.value().end(); ++e) { row[parse_id(e.key(), row.size())] = parse_bias(e.value()); }
+        } else { fail("layer must contain an ID array or expert-value object"); }
+        if (size_t(std::count_if(row.begin(), row.end(), [](float f) { return std::isfinite(f); })) < model.hparams.n_expert_used(il)) {
+            fail("fewer than top_k finite experts");
+        }
+    }
+    size_t n = 0;
+    for (const auto & row : values) {
+        if (std::any_of(row.second.begin(), row.second.end(), [](float f) { return f != 0; })) { ++n; }
+    }
+    if (n) {
+        model.cnm_mask_ctx = ggml_init({n * ggml_tensor_overhead(), nullptr, true});
+        if (!model.cnm_mask_ctx) { fail("cannot allocate context"); }
+        for (const auto & row : values) {
+            if (std::none_of(row.second.begin(), row.second.end(), [](float f) { return f != 0; })) { continue; }
+            auto * tensor = ggml_new_tensor_1d(model.cnm_mask_ctx, GGML_TYPE_F32, row.second.size());
+            ggml_set_name(tensor, ("cnm_router_mask-" + std::to_string(row.first)).c_str());
+            model.cnm_router_masks.emplace(row.first, tensor);
+        }
+        model.cnm_mask_buffer = ggml_backend_alloc_ctx_tensors_from_buft(model.cnm_mask_ctx, ggml_backend_cpu_buffer_type());
+        if (!model.cnm_mask_buffer) { fail("cannot allocate buffer"); }
+        ggml_backend_buffer_set_usage(model.cnm_mask_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (const auto & row : model.cnm_router_masks) {
+            const auto & data = values.at(row.first);
+            ggml_backend_tensor_set(row.second, data.data(), 0, data.size() * sizeof(float));
+        }
+    }
+    const std::string encoded = plan.dump();
+    LLAMA_LOG_INFO("CNM_EXPERT_BIAS: %zu layers, %zu nonzero vectors, plan sha256 %s\n", values.size(), n,
+                   hash_sha256_hex(encoded.data(), encoded.size()).c_str());
+}
+
 // Keep the router's matrix and reduction dimensions independent of the cut.
 static void restore_cut_routers(llama_model_base & model, llama_model_loader & ml) {
     auto * meta = ml.metadata;
@@ -2242,6 +2335,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     cnm_apply_expert_mask(*this);
     restore_cut_routers(*this, ml);
+    cnm_apply_expert_bias(*this);
 
     load_tensors_hadamard();
 
