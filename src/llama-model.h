@@ -721,7 +721,7 @@ struct llama_model {
 
     llama_hadamard hdmd;
 
-    // Owned constant router-logit masks; empty when CNM_EXPERT_MASK is absent.
+    // Owned constant router-logit offsets for CNM_EXPERT_MASK or CNM_EXPERT_BIAS.
     std::map<int, ggml_tensor *> cnm_router_masks;
     ggml_context * cnm_mask_ctx = nullptr;
     ggml_backend_buffer_t cnm_mask_buffer = nullptr;
