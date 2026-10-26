@@ -12287,6 +12287,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // Variable expert counts, including fused and fallback CUDA top-k sizes.
+    for (int n_expert : {121, 128, 193, 252, 256}) {
+        for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+            for (int64_t n_tokens : {1, 64}) {
+                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, n_expert, 10, false, 64, n_tokens, 256));
+            }
+        }
+        test_cases.emplace_back(new test_topk_moe({n_expert, 64, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX));
+    }
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {

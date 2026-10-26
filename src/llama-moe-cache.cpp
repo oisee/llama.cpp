@@ -164,6 +164,13 @@ static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_laye
     return res;
 }
 
+static void llama_moe_cache_check_slots(int32_t n_slots, int32_t n_expert_used, size_t n_layers) {
+    if (n_slots < n_expert_used) {
+        throw std::runtime_error("MoE cache group with " + std::to_string(n_layers) +
+                " layers has " + std::to_string(n_slots) + " slots, below top-k " + std::to_string(n_expert_used));
+    }
+}
+
 static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, const std::vector<ggml_tensor *> & b) {
     if (a.size() != b.size()) {
         return false;
@@ -352,11 +359,7 @@ struct llama_moe_cache::impl {
             while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
                 g.n_slots++;
             }
-            if (g.n_slots < n_expert_used) {
-                LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
-                g.n_slots = 0;
-                continue;
-            }
+            llama_moe_cache_check_slots(g.n_slots, n_expert_used, g.layers.size());
             g.slru.init(model.layers.size(), n_expert, g.n_slots);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size();

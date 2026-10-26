@@ -1514,6 +1514,10 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             [&](uint32_t n) { return n == hparams.n_expert_max; })) {
         throw std::runtime_error("per-layer expert_count is currently supported only for qwen4exp");
     }
+    // Uniform loaders can append virtual or repeated layers in load_arch_hparams.
+    if (arch != LLM_ARCH_QWEN4EXP) {
+        hparams.n_expert_arr.fill(hparams.n_expert_max);
+    }
     std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
     ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
