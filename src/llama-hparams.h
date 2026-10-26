@@ -77,7 +77,8 @@ struct llama_hparams {
     // granite-switch: index of the single-head "router" KV layer that encodes
     // per-token adapter selection. -1 when the model has no such layer.
     int32_t  router_layer = -1;
-    uint32_t n_expert = 0;
+    uint32_t n_expert_max = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_expert_arr = {};
     uint32_t n_rel_attn_bkts = 0;
     uint32_t n_value_expert      = 0; // MoVA value experts (K2 Horizon)
     uint32_t n_value_expert_used = 0;
@@ -441,6 +442,7 @@ struct llama_hparams {
 
     uint32_t n_ff_exp(uint32_t il = 0) const;
 
+    uint32_t n_expert(uint32_t il) const;
     uint32_t n_expert_used(uint32_t il = 0) const;
 
     // return the maximum n_expert_used across all layers

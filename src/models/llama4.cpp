@@ -23,7 +23,7 @@ void llama_model_llama4::load_arch_hparams(llama_model_loader & ml) {
         ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
     }
 
-    switch (hparams.n_expert) {
+    switch (hparams.n_expert_max) {
         case 0: {
             // MobileLLM (no MoE)
             switch (hparams.n_embd) {

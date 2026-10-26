@@ -1406,15 +1406,22 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
     GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer_all);
-    ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
+    ml.get_key_or_arr(LLM_KV_EXPERT_COUNT, hparams.n_expert_arr, hparams.n_layer_all, false);
+    hparams.n_expert_max = *std::max_element(hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all);
+    // Other architecture loaders still use a single expert tensor shape.
+    if (arch != LLM_ARCH_QWEN4EXP && !std::all_of(hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all,
+            [&](uint32_t n) { return n == hparams.n_expert_max; })) {
+        throw std::runtime_error("per-layer expert_count is currently supported only for qwen4exp");
+    }
     std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
     ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
 
     if (arch == LLM_ARCH_HUNYUAN_VL || arch == LLM_ARCH_HUNYUAN_DENSE) {
-        if (hparams.n_expert <= 1) {
-            hparams.n_expert = 0;
+        if (hparams.n_expert_max <= 1) {
+            hparams.n_expert_max = 0;
+            hparams.n_expert_arr.fill(0);
             std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
         }
     }
@@ -1433,22 +1440,16 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         GGML_ASSERT(hparams.convnext.n_layer <= hparams.n_layer_all);
     }
 
-    // models may route a different number of experts per layer, so validate the maximum
-    uint32_t n_expert_used_max = hparams.n_expert_used_max();
-
-    GGML_ASSERT(hparams.n_expert <= LLAMA_MAX_EXPERTS);
-    GGML_ASSERT(n_expert_used_max <= hparams.n_expert);
-    if (hparams.n_expert > 0) {
-        GGML_ASSERT(n_expert_used_max > 0);
-        GGML_ASSERT(hparams.n_expert_groups < hparams.n_expert);
-        if (hparams.n_expert_groups > 1) {
-            GGML_ASSERT(hparams.n_expert % hparams.n_expert_groups == 0);
-            GGML_ASSERT(hparams.n_group_used > 0);
-            GGML_ASSERT(hparams.n_group_used < hparams.n_expert_groups);
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        const auto n_expert = hparams.n_expert(il);
+        const auto n_used = hparams.n_expert_used(il);
+        if (n_expert > LLAMA_MAX_EXPERTS || n_used > n_expert ||
+            (n_expert > 0 && hparams.n_expert_groups >= n_expert) ||
+            (n_expert == 0 && hparams.n_expert_groups != 0) ||
+            (hparams.n_expert_groups > 1 && (n_expert % hparams.n_expert_groups != 0 ||
+             hparams.n_group_used == 0 || hparams.n_group_used >= hparams.n_expert_groups))) {
+            throw std::runtime_error(format("invalid expert counts in layer %u: count=%u, top_k=%u", il, n_expert, n_used));
         }
-    } else {
-        GGML_ASSERT(n_expert_used_max == 0);
-        GGML_ASSERT(hparams.n_expert_groups == 0);
     }
 
     std::fill(hparams.n_head_arr.begin(),       hparams.n_head_arr.end(),       0);
@@ -1712,7 +1713,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // TODO: move to a separate function
         const auto tn = LLM_TN(arch);
 
-        const int64_t n_expert = hparams.n_expert;
+        const int64_t n_expert = hparams.n_expert_max;
 
         if (n_expert > 0 && hparams.n_expert_used_max() == 0) {
             throw std::runtime_error("model has expert layers but no expert layers are used");
@@ -1727,6 +1728,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // this avoids having to add scale loading to every architecture
         for (int i = 0; i < n_layer_all; ++i) {
             auto & layer = layers[i];
+            const int64_t n_expert = hparams.n_expert(i);
 
             // attention weight scales (per-tensor, shape {1})
             if (!layer.wq_s && layer.wq) {
@@ -2532,7 +2534,7 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: f_attn_scale          = %.1e\n",   __func__, hparams.f_attention_scale);
         LLAMA_LOG_INFO("%s: f_attn_value_scale    = %.4f\n",   __func__, hparams.f_attn_value_scale);
         LLAMA_LOG_INFO("%s: n_ff                  = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_ff(il); }, hparams.n_layer_all).c_str());
-        LLAMA_LOG_INFO("%s: n_expert              = %u\n",     __func__, hparams.n_expert);
+        LLAMA_LOG_INFO("%s: n_expert              = %u\n",     __func__, hparams.n_expert_max);
         LLAMA_LOG_INFO("%s: n_expert_used         = %u\n",     __func__, hparams.n_expert_used());
         LLAMA_LOG_INFO("%s: n_expert_groups       = %d\n",     __func__, hparams.n_expert_groups);
         LLAMA_LOG_INFO("%s: n_group_used          = %d\n",     __func__, hparams.n_group_used);
@@ -3823,7 +3825,7 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
 }
 
 int32_t llama_model_n_expert(const struct llama_model * model) {
-    return model->hparams.n_expert;
+    return model->hparams.n_expert_max;
 }
 
 int32_t llama_model_n_devices(const struct llama_model * model) {

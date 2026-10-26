@@ -216,6 +216,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     auto load_block = [&](int il, int flags) {
         auto & layer = layers[il];
+        const int64_t n_expert = hparams.n_expert(il);
 
         const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
@@ -1181,7 +1182,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_gate_exps,
             model.layers[il].ffn_down_exps,
             nullptr,
-            n_expert, n_expert_used,
+            hparams.n_expert(il), cparams.warmup ? hparams.n_expert(il) : n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,

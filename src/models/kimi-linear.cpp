@@ -515,7 +515,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
                 layer.ffn_gate_exps,
                 layer.ffn_down_exps,
                 layer.ffn_exp_probs_b,
-                hparams.n_expert,
+                hparams.n_expert_max,
                 hparams.n_expert_used(),
                 LLM_FFN_SILU, true,
                 hparams.expert_weights_scale,

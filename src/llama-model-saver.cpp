@@ -237,7 +237,13 @@ void llama_model_saver::add_kv_from_model() {
             hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.begin() + hparams.n_layer_all));
     add_kv(LLM_KV_USE_PARALLEL_RESIDUAL,             hparams.use_par_res);
     // add_kv(LLM_KV_TENSOR_DATA_LAYOUT,                ???);
-    add_kv(LLM_KV_EXPERT_COUNT,                      hparams.n_expert);
+    if (std::all_of(hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all,
+            [&](uint32_t n) { return n == hparams.n_expert_max; })) {
+        add_kv(LLM_KV_EXPERT_COUNT, hparams.n_expert_max);
+    } else {
+        add_kv(LLM_KV_EXPERT_COUNT, std::vector<uint32_t>(
+                hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all));
+    }
     add_kv(LLM_KV_EXPERT_USED_COUNT,                 hparams.n_expert_used());
     add_kv(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared);
     add_kv(LLM_KV_EXPERT_GROUP_COUNT,                hparams.n_expert_groups);

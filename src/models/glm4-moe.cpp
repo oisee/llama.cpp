@@ -33,7 +33,7 @@ void llama_model_glm4_moe::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    GGML_ASSERT(hparams.n_expert > 0 && "n_expert must be > 0 for GLM4_MOE MoE layers");
+    GGML_ASSERT(hparams.n_expert_max > 0 && "n_expert must be > 0 for GLM4_MOE MoE layers");
     GGML_ASSERT(hparams.n_expert_used() > 0 && "n_expert_used must be > 0 for GLM4_MOE MoE layers");
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);

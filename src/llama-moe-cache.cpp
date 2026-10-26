@@ -268,7 +268,7 @@ struct llama_moe_cache::impl {
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
         }
-        if (model.hparams.n_expert == 0 || n_expert_used == 0) {
+        if (model.hparams.n_expert_max == 0 || n_expert_used == 0) {
             throw std::runtime_error("MoE cache requires a MoE model");
         }
 

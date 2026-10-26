@@ -6,7 +6,7 @@ void llama_model_maion_coder::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,         hparams.n_moe_layer_step);
     ml.get_key(LLM_KV_MOE_LATENT_SIZE,                   hparams.moe_latent_size);
 
-    if (hparams.n_moe_layer_step == 0 || hparams.moe_latent_size == 0 || hparams.n_expert == 0) {
+    if (hparams.n_moe_layer_step == 0 || hparams.moe_latent_size == 0 || hparams.n_expert_max == 0) {
         throw std::runtime_error("maion-coder requires a positive MoE layer step, latent size and expert count");
     }
 

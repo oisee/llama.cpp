@@ -38,8 +38,8 @@ void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
     }
 
     switch (hparams.n_layer()) {
-        case 24: type = hparams.n_embd == 1536 && hparams.n_expert == 128 ? LLM_TYPE_7_9B_A1_3B : LLM_TYPE_UNKNOWN; break;
-        case 42: type = hparams.n_embd == 2560 && hparams.n_expert == 512 ? LLM_TYPE_124B_A5_1B : LLM_TYPE_UNKNOWN; break;
+        case 24: type = hparams.n_embd == 1536 && hparams.n_expert_max == 128 ? LLM_TYPE_7_9B_A1_3B : LLM_TYPE_UNKNOWN; break;
+        case 42: type = hparams.n_embd == 2560 && hparams.n_expert_max == 512 ? LLM_TYPE_124B_A5_1B : LLM_TYPE_UNKNOWN; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
 }

@@ -585,7 +585,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
         layer.ffn_gate_exps,
         layer.ffn_down_exps,
         layer.ffn_exp_probs_b,
-        hparams.n_expert,
+        hparams.n_expert_max,
         hparams.n_expert_used(),
         LLM_FFN_SITU, hparams.expert_weights_norm,
         hparams.expert_weights_scale,
