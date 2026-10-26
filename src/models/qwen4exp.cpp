@@ -1182,14 +1182,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_gate_exps,
             model.layers[il].ffn_down_exps,
             nullptr,
-            hparams.n_expert(il), cparams.warmup ? hparams.n_expert(il) : n_expert_used,
+            model.layers[il].ffn_gate_inp->ne[1], cparams.warmup ? hparams.n_expert(il) : n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr, nullptr, 1e-5f,
+            model.layers[il].ffn_router_mask,
+            model.layers[il].ffn_expert_map);
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference

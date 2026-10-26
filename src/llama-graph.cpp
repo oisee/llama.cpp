@@ -2165,7 +2165,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor * router_mask,
+         ggml_tensor * expert_map) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2188,7 +2190,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        router_mask,
+        expert_map
     );
 }
 
@@ -2218,7 +2222,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor * router_mask,
+         ggml_tensor * expert_map) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2251,6 +2257,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             logits = ggml_add(ctx0, logits, mask->second);
             cb(logits, "cnm_ffn_moe_logits_masked", il);
         }
+    }
+
+    if (router_mask) {
+        logits = ggml_add(ctx0, logits, router_mask);
+        cb(logits, "cut_ffn_moe_logits_masked", il);
     }
 
     ggml_tensor * probs = nullptr;
@@ -2366,6 +2377,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    if (expert_map) {
+        auto * flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used * n_tokens);
+        selected_experts = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, expert_map, flat), n_expert_used, n_tokens);
+        cb(selected_experts, "cut_ffn_moe_topk_compact", il);
     }
 
     //call early so that topk-moe can be used

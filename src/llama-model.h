@@ -395,6 +395,8 @@ struct llama_layer {
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
     struct ggml_tensor * ffn_exp_probs_b_vl = nullptr; // deepseek4 vision (bias for image tokens)
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
+    struct ggml_tensor * ffn_router_mask = nullptr;
+    struct ggml_tensor * ffn_expert_map = nullptr;
 
     struct ggml_tensor * dflash_attn_conv_base = nullptr;
     struct ggml_tensor * dflash_attn_conv_proj = nullptr;
@@ -723,6 +725,10 @@ struct llama_model {
     std::map<int, ggml_tensor *> cnm_router_masks;
     ggml_context * cnm_mask_ctx = nullptr;
     ggml_backend_buffer_t cnm_mask_buffer = nullptr;
+
+    // Reconstructed source-width routers for physical expert cuts.
+    std::vector<ggml_context *> cut_router_contexts;
+    std::vector<ggml_backend_buffer_t> cut_router_buffers;
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;

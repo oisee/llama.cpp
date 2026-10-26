@@ -139,6 +139,79 @@ static void cnm_apply_expert_mask(llama_model_base & model) {
     LLAMA_LOG_INFO("CNM_EXPERT_MASK: canonical sha256 %s\n", hash_sha256_hex(encoded.data(), encoded.size()).c_str());
 }
 
+// Keep the router's matrix and reduction dimensions independent of the cut.
+static void restore_cut_routers(llama_model_base & model, llama_model_loader & ml) {
+    auto * meta = ml.metadata;
+    const int64_t flag = gguf_find_key(meta, "cnm.preserve_router_layout");
+    if (flag < 0) { return; }
+    if (gguf_get_kv_type(meta, flag) != GGUF_TYPE_BOOL) {
+        throw std::runtime_error("cnm.preserve_router_layout must be BOOL");
+    }
+    if (!gguf_get_val_bool(meta, flag)) { return; }
+    const int64_t count_key = gguf_find_key(meta, "cnm.expert_source_count");
+    const int64_t ids_key = gguf_find_key(meta, "cnm.expert_ids");
+    if (model.arch != LLM_ARCH_QWEN4EXP || count_key < 0 || ids_key < 0 ||
+            gguf_get_kv_type(meta, count_key) != GGUF_TYPE_UINT32 ||
+            gguf_get_kv_type(meta, ids_key) != GGUF_TYPE_STRING) {
+        throw std::runtime_error("invalid source router metadata");
+    }
+    const uint32_t count = gguf_get_val_u32(meta, count_key);
+    if (count == 0 || count > LLAMA_MAX_EXPERTS) {
+        throw std::runtime_error("source router count out of range");
+    }
+    const auto ids = nlohmann::ordered_json::parse(gguf_get_val_str(meta, ids_key));
+    if (!ids.is_object() || ids.size() != model.layers.size()) {
+        throw std::runtime_error("source router IDs must cover every layer");
+    }
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        auto & layer = model.layers[il];
+        auto * compact = layer.ffn_gate_inp;
+        const auto & kept = ids.at(std::to_string(il));
+        if (!compact || !kept.is_array() || kept.size() != size_t(compact->ne[1]) ||
+                ggml_is_quantized(compact->type) || compact->ne[1] > count) {
+            throw std::runtime_error("invalid compact router layout");
+        }
+        std::vector<int32_t> remap(count, -1);
+        std::vector<float> mask(count, -INFINITY);
+        for (size_t slot = 0; slot < kept.size(); ++slot) {
+            const auto & value = kept[slot];
+            if (!value.is_number_integer() || value.get<int64_t>() < 0 || value.get<int64_t>() >= count) {
+                throw std::runtime_error("source router ID out of range");
+            }
+            const int id = value.get<int>();
+            if (remap[id] != -1) { throw std::runtime_error("duplicate source router ID"); }
+            remap[id] = int32_t(slot);
+            mask[id] = 0.0f;
+        }
+        auto * ctx = ggml_init({3 * ggml_tensor_overhead(), nullptr, true});
+        if (!ctx) { throw std::runtime_error("cannot allocate source router context"); }
+        model.cut_router_contexts.push_back(ctx);
+        auto * router = ggml_new_tensor_2d(ctx, compact->type, compact->ne[0], count);
+        auto * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, count);
+        auto * map = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, count);
+        ggml_format_name(router, "source_router-%zu", il);
+        ggml_format_name(bias, "source_router_mask-%zu", il);
+        ggml_format_name(map, "source_expert_map-%zu", il);
+        auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(compact->buffer));
+        if (!buffer) { throw std::runtime_error("cannot allocate source router buffer"); }
+        model.cut_router_buffers.push_back(buffer);
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<uint8_t> original(ggml_nbytes(compact));
+        std::vector<uint8_t> expanded(ggml_nbytes(router), 0);
+        ggml_backend_tensor_get(compact, original.data(), 0, original.size());
+        const size_t row = ggml_row_size(compact->type, compact->ne[0]);
+        for (size_t slot = 0; slot < kept.size(); ++slot) {
+            std::memcpy(expanded.data() + kept[slot].get<size_t>() * row, original.data() + slot * row, row);
+        }
+        ggml_backend_tensor_set(router, expanded.data(), 0, expanded.size());
+        ggml_backend_tensor_set(bias, mask.data(), 0, mask.size() * sizeof(float));
+        ggml_backend_tensor_set(map, remap.data(), 0, remap.size() * sizeof(int32_t));
+        layer.ffn_gate_inp = router;
+        layer.ffn_router_mask = bias;
+        layer.ffn_expert_map = map;
+    }
+}
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_CLIP:
@@ -1454,6 +1527,8 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    for (auto * buffer : cut_router_buffers) { ggml_backend_buffer_free(buffer); }
+    for (auto * ctx : cut_router_contexts) { ggml_free(ctx); }
     ggml_backend_buffer_free(cnm_mask_buffer);
     if (cnm_mask_ctx) { ggml_free(cnm_mask_ctx); }
     for (auto * lora : loras) {
@@ -2166,6 +2241,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     cnm_apply_expert_mask(*this);
+    restore_cut_routers(*this, ml);
 
     load_tensors_hadamard();
 
