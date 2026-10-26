@@ -719,6 +719,11 @@ struct llama_model {
 
     llama_hadamard hdmd;
 
+    // Owned constant router-logit masks; empty when CNM_EXPERT_MASK is absent.
+    std::map<int, ggml_tensor *> cnm_router_masks;
+    ggml_context * cnm_mask_ctx = nullptr;
+    ggml_backend_buffer_t cnm_mask_buffer = nullptr;
+
     // see llama_model_set_attn_rot
     bool attn_rot = true;
 

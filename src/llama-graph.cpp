@@ -1576,6 +1576,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    cnm_router_masks (params.cnm_router_masks),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2237,6 +2238,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (gate_inp_b) {
         logits = ggml_add(ctx0, logits, gate_inp_b);
         cb(logits, "ffn_moe_logits_biased", il);
+    }
+
+    // qwen4exp has no selection-bias tensor: exclude experts BEFORE softmax.
+    // -infinity gives exactly zero probability for every finite retained logit.
+    // This neither changes router weights nor touches the separate shared expert.
+    if (cnm_router_masks) {
+        const auto mask = cnm_router_masks->find(il);
+        if (mask != cnm_router_masks->end()) {
+            GGML_ASSERT(exp_probs_b == nullptr && gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX);
+            logits = ggml_add(ctx0, logits, mask->second);
+            cb(logits, "cnm_ffn_moe_logits_masked", il);
+        }
     }
 
     ggml_tensor * probs = nullptr;

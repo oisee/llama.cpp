@@ -482,7 +482,8 @@ struct llama_mmap::impl {
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
         int fd = file->file_id();
-        int flags = MAP_SHARED;
+        const bool cnm_mask = std::getenv("CNM_EXPERT_MASK") != nullptr;
+        int flags = cnm_mask ? MAP_PRIVATE : MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
@@ -492,7 +493,7 @@ struct llama_mmap::impl {
         // MAP_POPULATE would fault in the lazy ranges too
         if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
 #endif
-        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
+        addr = mmap(NULL, file->size(), PROT_READ | (cnm_mask ? PROT_WRITE : 0), flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
@@ -593,14 +594,15 @@ struct llama_mmap::impl {
 
         HANDLE hFile = (HANDLE) _get_osfhandle(file->file_id());
 
-        hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        const bool cnm_mask = std::getenv("CNM_EXPERT_MASK") != nullptr;
+        hMapping = CreateFileMappingA(hFile, NULL, cnm_mask ? PAGE_WRITECOPY : PAGE_READONLY, 0, 0, NULL);
 
         if (hMapping == NULL) {
             DWORD error = GetLastError();
             throw std::runtime_error(format("CreateFileMappingA failed: %s", llama_format_win_err(error).c_str()));
         }
 
-        addr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+        addr = MapViewOfFile(hMapping, cnm_mask ? FILE_MAP_COPY : FILE_MAP_READ, 0, 0, 0);
         DWORD error = GetLastError();
 
         if (addr == NULL) {

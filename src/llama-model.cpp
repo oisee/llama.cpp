@@ -24,6 +24,10 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "../vendor/nlohmann/json.hpp"
+#include "../vendor/hash/hash.h"
+#include <fstream>
+#include <set>
 
 #include <algorithm>
 #include <cassert>
@@ -39,6 +43,101 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+
+// Validate and allocate at load time; no tensor reads/writes when disabled.
+static void cnm_apply_expert_mask(llama_model_base & model) {
+    const char * path = std::getenv("CNM_EXPERT_MASK");
+    if (!path) { return; }
+    using json = nlohmann::ordered_json;
+    auto fail = [](const std::string & why) { throw std::runtime_error("CNM_EXPERT_MASK: " + why); };
+    std::ifstream input(path);
+    if (!input) { fail("cannot open keep JSON: " + std::string(path)); }
+    // Reject duplicate object keys instead of silently accepting the last value.
+    std::set<std::string> keys;
+    auto callback = [&](int, json::parse_event_t event, json & value) {
+        if (event == json::parse_event_t::key && !keys.insert(value.get<std::string>()).second) {
+            fail("duplicate layer key");
+        }
+        return true;
+    };
+    json mask = json::parse(input, callback);
+    if (!mask.is_object()) { fail("mask must be an object with canonical nonnegative layer keys"); }
+    std::map<int, std::vector<int>> keep;
+    for (auto it = mask.begin(); it != mask.end(); ++it) {
+        if (!std::regex_match(it.key(), std::regex("0|[1-9][0-9]*"))) { fail("invalid layer key: " + it.key()); }
+        int layer;
+        try { layer = std::stoi(it.key()); } catch (...) { fail("layer key out of range"); return; }
+        if (layer >= int(model.layers.size()) || !model.layers[layer].ffn_gate_inp) { fail("unknown MoE layer: " + it.key()); }
+        if (!it.value().is_array()) { fail("expert IDs must be an array in layer " + it.key()); }
+        std::set<int> unique;
+        auto & ids = keep[layer];
+        for (const auto & e : it.value()) {
+            if ((!e.is_number_integer() && !e.is_number_unsigned()) || e.is_boolean() ||
+                e.get<double>() < 0 || e.get<double>() >= model.hparams.n_expert(layer)) { fail("expert ID out of range/type in layer " + it.key()); }
+            const int id = e.get<int>();
+            if (!unique.insert(id).second) { fail("duplicate expert ID in layer " + it.key()); }
+            ids.push_back(id);
+        }
+        std::sort(ids.begin(), ids.end());
+        if (ids.size() < model.hparams.n_expert_used(layer)) { fail("kept count below top_k in layer " + it.key()); }
+    }
+    if (keep.empty()) { fail("no supported MoE layers"); }
+    // Validate the entire plan before changing a single tensor (including NextN).
+    for (size_t i = 0; i < model.layers.size(); ++i) {
+        const auto & layer = model.layers[i];
+        if (!layer.ffn_gate_inp) { continue; }
+        if (!keep.count(int(i))) { fail("missing MoE layer (including NextN): " + std::to_string(i)); }
+        const auto * bias = layer.ffn_exp_probs_b;
+        if (!bias && model.arch != LLM_ARCH_QWEN4EXP) {
+            fail("router-logit fallback is validated only for qwen4exp (layer " + std::to_string(i) + ")");
+        }
+        if (bias && (bias->type != GGML_TYPE_F32 || ggml_nelements(bias) != model.hparams.n_expert(i))) {
+            fail("exp_probs_b must be an F32 expert vector in layer " + std::to_string(i));
+        }
+        if (model.hparams.n_expert_groups > 1 && keep[int(i)].size() != model.hparams.n_expert(i)) {
+            fail("pruning grouped routing is unsafe: selected groups may contain fewer than top_k kept experts");
+        }
+    }
+    // Allocate small persistent F32 constants only for the no-selection-bias route.
+    // All-kept plans add no graph operations. The model owns context and buffer.
+    size_t n_masks = 0;
+    for (const auto & entry : keep) {
+        if (!model.layers[entry.first].ffn_exp_probs_b && entry.second.size() != model.hparams.n_expert(entry.first)) { ++n_masks; }
+    }
+    if (n_masks) {
+        model.cnm_mask_ctx = ggml_init({n_masks * ggml_tensor_overhead(), nullptr, true});
+        if (!model.cnm_mask_ctx) { fail("cannot allocate router-mask context"); }
+        for (const auto & entry : keep) {
+            if (model.layers[entry.first].ffn_exp_probs_b || entry.second.size() == model.hparams.n_expert(entry.first)) { continue; }
+            auto * mask = ggml_new_tensor_1d(model.cnm_mask_ctx, GGML_TYPE_F32, model.hparams.n_expert(entry.first));
+            ggml_set_name(mask, ("cnm_router_mask-" + std::to_string(entry.first)).c_str());
+            model.cnm_router_masks.emplace(entry.first, mask);
+        }
+        model.cnm_mask_buffer = ggml_backend_alloc_ctx_tensors_from_buft(model.cnm_mask_ctx, ggml_backend_cpu_buffer_type());
+        if (!model.cnm_mask_buffer) { fail("cannot allocate router-mask buffer"); }
+        ggml_backend_buffer_set_usage(model.cnm_mask_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+    // Canonical JSON: numeric layer order, ascending IDs, no whitespace/newline.
+    json canonical = json::object();
+    for (const auto & entry : keep) { canonical[std::to_string(entry.first)] = entry.second; }
+    const std::string encoded = canonical.dump();
+    for (const auto & entry : keep) {
+        auto * bias = model.layers[entry.first].ffn_exp_probs_b;
+        const auto found = model.cnm_router_masks.find(entry.first);
+        auto * target = bias ? bias : (found == model.cnm_router_masks.end() ? nullptr : found->second);
+        if (!target) { continue; } // all-kept no-bias layer
+        std::vector<float> values(model.hparams.n_expert(entry.first), 0.0f);
+        if (bias) { ggml_backend_tensor_get(bias, values.data(), 0, values.size() * sizeof(float)); }
+        for (int e = 0; e < int(values.size()); ++e) {
+            if (!std::binary_search(entry.second.begin(), entry.second.end(), e)) { values[e] = bias ? -1e30f : -INFINITY; }
+        }
+        ggml_backend_tensor_set(target, values.data(), 0, values.size() * sizeof(float));
+        LLAMA_LOG_INFO("CNM_EXPERT_MASK: layer %d masked %zu/%u experts\n", entry.first,
+                       values.size() - entry.second.size(), model.hparams.n_expert(entry.first));
+    }
+    LLAMA_LOG_INFO("CNM_EXPERT_MASK: canonical sha256 %s\n", hash_sha256_hex(encoded.data(), encoded.size()).c_str());
+}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1355,6 +1454,8 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    ggml_backend_buffer_free(cnm_mask_buffer);
+    if (cnm_mask_ctx) { ggml_free(cnm_mask_ctx); }
     for (auto * lora : loras) {
         delete lora;
     }
@@ -2059,6 +2160,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    cnm_apply_expert_mask(*this);
 
     load_tensors_hadamard();
 

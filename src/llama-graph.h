@@ -810,6 +810,7 @@ struct llm_graph_params {
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
+    const std::map<int, ggml_tensor *> * cnm_router_masks = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1068,6 +1069,7 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
+    const std::map<int, ggml_tensor *> * cnm_router_masks;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
