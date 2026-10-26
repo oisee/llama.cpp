@@ -996,6 +996,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<std::string> splits = {};
     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
         fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
+    if (gguf_find_key(ml.metadata, "cnm.expert_tiers.version") >= 0) {
+        throw std::runtime_error("quantize single-tier weights before tiering; tiered input is not qualified for re-quantization");
+    }
     ml.init_mappings(false); // no prefetching
 
     auto mparams = llama_model_default_params();

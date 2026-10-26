@@ -68,7 +68,9 @@ static void cnm_apply_expert_mask(llama_model_base & model) {
         if (!std::regex_match(it.key(), std::regex("0|[1-9][0-9]*"))) { fail("invalid layer key: " + it.key()); }
         int layer;
         try { layer = std::stoi(it.key()); } catch (...) { fail("layer key out of range"); return; }
-        if (layer >= int(model.layers.size()) || !model.layers[layer].ffn_gate_inp) { fail("unknown MoE layer: " + it.key()); }
+        if (layer >= int(model.layers.size()) || (!model.layers[layer].ffn_gate_inp &&
+                !(model.arch == LLM_ARCH_GLM5_NEXT && layer >= int(model.hparams.n_layer()) &&
+                  layer >= int(model.hparams.n_layer_dense_lead)))) { fail("unknown MoE layer: " + it.key()); }
         if (!it.value().is_array()) { fail("expert IDs must be an array in layer " + it.key()); }
         std::set<int> unique;
         auto & ids = keep[layer];
@@ -103,13 +105,13 @@ static void cnm_apply_expert_mask(llama_model_base & model) {
     // All-kept plans add no graph operations. The model owns context and buffer.
     size_t n_masks = 0;
     for (const auto & entry : keep) {
-        if (!model.layers[entry.first].ffn_exp_probs_b && entry.second.size() != model.hparams.n_expert(entry.first)) { ++n_masks; }
+        if (model.layers[entry.first].ffn_gate_inp && !model.layers[entry.first].ffn_exp_probs_b && entry.second.size() != model.hparams.n_expert(entry.first)) { ++n_masks; }
     }
     if (n_masks) {
         model.cnm_mask_ctx = ggml_init({n_masks * ggml_tensor_overhead(), nullptr, true});
         if (!model.cnm_mask_ctx) { fail("cannot allocate router-mask context"); }
         for (const auto & entry : keep) {
-            if (model.layers[entry.first].ffn_exp_probs_b || entry.second.size() == model.hparams.n_expert(entry.first)) { continue; }
+            if (!model.layers[entry.first].ffn_gate_inp || model.layers[entry.first].ffn_exp_probs_b || entry.second.size() == model.hparams.n_expert(entry.first)) { continue; }
             auto * mask = ggml_new_tensor_1d(model.cnm_mask_ctx, GGML_TYPE_F32, model.hparams.n_expert(entry.first));
             ggml_set_name(mask, ("cnm_router_mask-" + std::to_string(entry.first)).c_str());
             model.cnm_router_masks.emplace(entry.first, mask);
@@ -150,7 +152,7 @@ static void restore_cut_routers(llama_model_base & model, llama_model_loader & m
     if (!gguf_get_val_bool(meta, flag)) { return; }
     const int64_t count_key = gguf_find_key(meta, "cnm.expert_source_count");
     const int64_t ids_key = gguf_find_key(meta, "cnm.expert_ids");
-    if (model.arch != LLM_ARCH_QWEN4EXP || count_key < 0 || ids_key < 0 ||
+    if ((model.arch != LLM_ARCH_QWEN4EXP && model.arch != LLM_ARCH_GLM5_NEXT) || count_key < 0 || ids_key < 0 ||
             gguf_get_kv_type(meta, count_key) != GGUF_TYPE_UINT32 ||
             gguf_get_kv_type(meta, ids_key) != GGUF_TYPE_STRING) {
         throw std::runtime_error("invalid source router metadata");
@@ -160,12 +162,14 @@ static void restore_cut_routers(llama_model_base & model, llama_model_loader & m
         throw std::runtime_error("source router count out of range");
     }
     const auto ids = nlohmann::ordered_json::parse(gguf_get_val_str(meta, ids_key));
-    if (!ids.is_object() || ids.size() != model.layers.size()) {
-        throw std::runtime_error("source router IDs must cover every layer");
+    const size_t moe_layers = model.layers.size() - (model.arch == LLM_ARCH_GLM5_NEXT ? model.hparams.n_layer_dense_lead : 0);
+    if (!ids.is_object() || ids.size() != moe_layers) {
+        throw std::runtime_error("source router IDs must cover every MoE layer");
     }
     for (size_t il = 0; il < model.layers.size(); ++il) {
         auto & layer = model.layers[il];
         auto * compact = layer.ffn_gate_inp;
+        if (!compact) { continue; }
         const auto & kept = ids.at(std::to_string(il));
         if (!compact || !kept.is_array() || kept.size() != size_t(compact->ne[1]) ||
                 ggml_is_quantized(compact->type) || compact->ne[1] > count) {
@@ -183,11 +187,12 @@ static void restore_cut_routers(llama_model_base & model, llama_model_loader & m
             remap[id] = int32_t(slot);
             mask[id] = 0.0f;
         }
-        auto * ctx = ggml_init({3 * ggml_tensor_overhead(), nullptr, true});
+        auto * ctx = ggml_init({4 * ggml_tensor_overhead(), nullptr, true});
         if (!ctx) { throw std::runtime_error("cannot allocate source router context"); }
         model.cut_router_contexts.push_back(ctx);
         auto * router = ggml_new_tensor_2d(ctx, compact->type, compact->ne[0], count);
         auto * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, count);
+        auto * selection_bias = layer.ffn_exp_probs_b ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, count) : nullptr;
         auto * map = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, count);
         ggml_format_name(router, "source_router-%zu", il);
         ggml_format_name(bias, "source_router_mask-%zu", il);
@@ -206,6 +211,17 @@ static void restore_cut_routers(llama_model_base & model, llama_model_loader & m
         ggml_backend_tensor_set(router, expanded.data(), 0, expanded.size());
         ggml_backend_tensor_set(bias, mask.data(), 0, mask.size() * sizeof(float));
         ggml_backend_tensor_set(map, remap.data(), 0, remap.size() * sizeof(int32_t));
+        if (selection_bias) {
+            if (layer.ffn_exp_probs_b->type != GGML_TYPE_F32 || ggml_nelements(layer.ffn_exp_probs_b) != int64_t(kept.size())) {
+                throw std::runtime_error("compact selection bias must be an F32 expert vector");
+            }
+            std::vector<float> compact_bias(kept.size());
+            std::vector<float> expanded_bias(count, -INFINITY);
+            ggml_backend_tensor_get(layer.ffn_exp_probs_b, compact_bias.data(), 0, compact_bias.size() * sizeof(float));
+            for (size_t slot = 0; slot < kept.size(); ++slot) { expanded_bias[kept[slot].get<size_t>()] = compact_bias[slot]; }
+            ggml_backend_tensor_set(selection_bias, expanded_bias.data(), 0, expanded_bias.size() * sizeof(float));
+            layer.ffn_exp_probs_b = selection_bias;
+        }
         layer.ffn_gate_inp = router;
         layer.ffn_router_mask = bias;
         layer.ffn_expert_map = map;
@@ -1585,12 +1601,12 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_COUNT, hparams.n_expert_arr, hparams.n_layer_all, false);
     hparams.n_expert_max = *std::max_element(hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all);
     // Other architecture loaders still use a single expert tensor shape.
-    if (arch != LLM_ARCH_QWEN4EXP && !std::all_of(hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all,
+    if (arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_GLM5_NEXT && !std::all_of(hparams.n_expert_arr.begin(), hparams.n_expert_arr.begin() + hparams.n_layer_all,
             [&](uint32_t n) { return n == hparams.n_expert_max; })) {
-        throw std::runtime_error("per-layer expert_count is currently supported only for qwen4exp");
+        throw std::runtime_error("per-layer expert_count is currently supported only for qwen4exp and glm5-next");
     }
     // Uniform loaders can append virtual or repeated layers in load_arch_hparams.
-    if (arch != LLM_ARCH_QWEN4EXP) {
+    if (arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_GLM5_NEXT) {
         hparams.n_expert_arr.fill(hparams.n_expert_max);
     }
     std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
@@ -2242,6 +2258,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     cnm_apply_expert_mask(*this);
     restore_cut_routers(*this, ml);
+    for (size_t il = 0; il < expert_tiers.size(); ++il) {
+        const auto & layer = expert_tiers[il];
+        if (!layer.tiered) { continue; }
+        for (const auto * bank : {&layer.hot, &layer.cold}) {
+            if (!bank->down) { continue; }
+            auto execution_device = [](ggml_tensor * tensor) {
+                return ggml_backend_buffer_is_host(tensor->buffer) ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) :
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+            };
+            auto * reference = execution_device(bank->down);
+            auto * router = layers[il].ffn_gate_inp;
+            auto * router_device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(router->buffer));
+            if (!ggml_backend_buffer_is_host(bank->down->buffer) &&
+                    (ggml_backend_buffer_is_host(router->buffer) || reference != router_device)) {
+                throw std::runtime_error("expert tiers: CUDA bank must share its layer router device");
+            }
+            size_t bytes = 0;
+            for (auto * tensor : {bank->gate, bank->up, bank->down, bank->gate_up}) {
+                if (!tensor) { continue; }
+                bytes += ggml_nbytes(tensor);
+                auto * device = execution_device(tensor);
+                if (device != reference) { throw std::runtime_error("expert tiers: conflicting bank projection placement"); }
+            }
+            LLAMA_LOG_INFO("expert tiers: layer %zu %s experts=%zu execution=%s buffer=%s weight_bytes=%zu\n", il,
+                    bank == &layer.hot ? "hot" : "cold", bank->ids.size(), reference ? ggml_backend_dev_name(reference) : "CPU",
+                    ggml_backend_buffer_name(bank->down->buffer), bytes);
+        }
+    }
+
 
     load_tensors_hadamard();
 
@@ -2584,6 +2629,10 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     if (tn.bid != -1) {
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
+    }
+    if (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS_COLD || tn.tensor == LLM_TENSOR_FFN_UP_EXPS_COLD ||
+            tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS_COLD || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS_COLD) {
+        buft_list_layer = &pimpl->cpu_buft_list;
     }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
@@ -4041,6 +4090,119 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);
+}
+
+bool llama_model_base::create_tensor_expert_tiers(int bid, int64_t dim, int64_t ff, int flags) {
+    auto * meta = ml->metadata;
+    const int64_t version = gguf_find_key(meta, "cnm.expert_tiers.version");
+    if (version < 0) { return false; }
+    if (expert_tiers.empty()) {
+        expert_tiers.resize(hparams.n_layer_all);
+        tier_metadata.reset(gguf_init_empty());
+        gguf_set_kv(tier_metadata.get(), meta);
+    }
+    auto & layer = expert_tiers.at(bid);
+    auto fail = [](const std::string & message) { throw std::runtime_error("expert tiers: " + message); };
+    if (gguf_get_kv_type(meta, version) != GGUF_TYPE_UINT32 || gguf_get_val_u32(meta, version) != 1) { fail("unsupported version"); }
+    if (params.split_mode != LLAMA_SPLIT_MODE_LAYER && params.split_mode != LLAMA_SPLIT_MODE_NONE) { fail("only layer splitting is supported"); }
+    auto json_key = [&](const char * key) {
+        int64_t index = gguf_find_key(meta, key);
+        if (index < 0 || gguf_get_kv_type(meta, index) != GGUF_TYPE_STRING) { fail(std::string("missing STRING ") + key); }
+        std::vector<std::set<std::string>> seen;
+        auto callback = [&](int, nlohmann::ordered_json::parse_event_t event, nlohmann::ordered_json & value) {
+            if (event == nlohmann::ordered_json::parse_event_t::object_start) { seen.emplace_back(); }
+            if (event == nlohmann::ordered_json::parse_event_t::key && !seen.back().insert(value.get<std::string>()).second) { fail("duplicate JSON key"); }
+            if (event == nlohmann::ordered_json::parse_event_t::object_end) { seen.pop_back(); }
+            return true;
+        };
+        return nlohmann::ordered_json::parse(gguf_get_val_str(meta, index), callback);
+    };
+    auto kept = json_key("cnm.expert_ids");
+    auto hot = json_key("cnm.expert_tiers.hot_ids");
+    auto cold = json_key("cnm.expert_tiers.cold_ids");
+    const int64_t source_key = gguf_find_key(meta, "cnm.expert_source_count");
+    const int64_t preserve = gguf_find_key(meta, "cnm.preserve_router_layout");
+    const int64_t counts_key = gguf_find_key(meta, "cnm.expert_tiers.hot_count");
+    if (source_key < 0 || gguf_get_kv_type(meta, source_key) != GGUF_TYPE_UINT32 || preserve < 0 ||
+            gguf_get_kv_type(meta, preserve) != GGUF_TYPE_BOOL || !gguf_get_val_bool(meta, preserve) ||
+            counts_key < 0 || gguf_get_kv_type(meta, counts_key) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(meta, counts_key) != GGUF_TYPE_UINT32 || gguf_get_arr_n(meta, counts_key) != hparams.n_layer_all) { fail("invalid counts or source-router metadata"); }
+    const uint32_t source = gguf_get_val_u32(meta, source_key);
+    if (!source || source > LLAMA_MAX_EXPERTS || hparams.n_expert_groups > 1) { fail("invalid source count or grouped router"); }
+    auto * counts = static_cast<const uint32_t *>(gguf_get_arr_data(meta, counts_key));
+    std::set<std::string> expected;
+    for (uint32_t l = 0; l < hparams.n_layer_all; ++l) {
+        if (arch == LLM_ARCH_GLM5_NEXT && l < hparams.n_layer_dense_lead) {
+            if (counts[l]) { fail("dense layer has hot experts"); }
+        } else { expected.insert(std::to_string(l)); }
+    }
+    for (const auto * mapping : {&kept, &hot, &cold}) {
+        if (!mapping->is_object() || mapping->size() != expected.size()) { fail("map layer keys disagree"); }
+        for (auto it = mapping->begin(); it != mapping->end(); ++it) {
+            if (!expected.count(it.key()) || !it.value().is_array()) { fail("unknown layer or invalid map"); }
+        }
+    }
+    // Validate stored NextN maps even when their payload is skipped.
+    for (const auto & key : expected) {
+        const int l = std::stoi(key);
+        std::set<int32_t> union_ids, kept_ids;
+        auto validate = [&](const nlohmann::ordered_json & array, std::set<int32_t> & ids, bool ordered) {
+            int32_t previous = -1;
+            for (const auto & item : array) {
+                if (!item.is_number_integer() || item.get<int64_t>() < 0 || item.get<int64_t>() >= source) { fail("ID out of range"); }
+                int32_t id = item.get<int32_t>();
+                if (!ids.insert(id).second || (ordered && id <= previous)) { fail("duplicate or unordered ID"); }
+                previous = id;
+            }
+        };
+        validate(kept[key], kept_ids, false);
+        validate(hot[key], union_ids, true);
+        validate(cold[key], union_ids, true);
+        if (union_ids != kept_ids || kept_ids.size() != hparams.n_expert(l) || hot[key].size() != counts[l] || kept_ids.size() < hparams.n_expert_used(l)) { fail("partition/count mismatch"); }
+    }
+    layer.tiered = true;
+    const std::string key = std::to_string(bid);
+    layer.hot.ids = hot[key].get<std::vector<int32_t>>();
+    layer.cold.ids = cold[key].get<std::vector<int32_t>>();
+    auto load = [&](llama_expert_bank & bank, bool is_hot) {
+        const int64_t n = bank.ids.size();
+        llm_tensor gate = is_hot ? LLM_TENSOR_FFN_GATE_EXPS_HOT : LLM_TENSOR_FFN_GATE_EXPS_COLD;
+        llm_tensor up = is_hot ? LLM_TENSOR_FFN_UP_EXPS_HOT : LLM_TENSOR_FFN_UP_EXPS_COLD;
+        llm_tensor down = is_hot ? LLM_TENSOR_FFN_DOWN_EXPS_HOT : LLM_TENSOR_FFN_DOWN_EXPS_COLD;
+        llm_tensor gate_up = is_hot ? LLM_TENSOR_FFN_GATE_UP_EXPS_HOT : LLM_TENSOR_FFN_GATE_UP_EXPS_COLD;
+        bool merged = ml->get_tensor_meta(tn(gate_up, "weight", bid).str().c_str()) != nullptr;
+        auto exists = [&](llm_tensor role) { return ml->get_tensor_meta(tn(role, "weight", bid).str().c_str()) != nullptr; };
+        if (!n) {
+            if (merged || exists(gate) || exists(up) || exists(down)) { fail("empty bank has tensors"); }
+            return;
+        }
+        if (merged && (exists(gate) || exists(up))) { fail("ambiguous merged and separate weights"); }
+        if (merged && arch == LLM_ARCH_GLM5_NEXT) { fail("GLM merged gate/up baseline is not qualified"); }
+        auto check_descriptor = [&](llm_tensor role, int64_t rows, int64_t columns) {
+            auto * tensor = ml->get_tensor_meta(tn(role, "weight", bid).str().c_str());
+            if (!tensor || tensor->ne[0] != rows || tensor->ne[1] != columns || tensor->ne[2] != n || tensor->ne[3] != 1) {
+                fail("missing or invalid bank descriptor: " + tn(role, "weight", bid).str());
+            }
+        };
+        check_descriptor(down, ff, dim);
+        if (merged) { check_descriptor(gate_up, dim, 2 * ff); }
+        else { check_descriptor(gate, dim, ff); check_descriptor(up, dim, ff); }
+        bank.down = create_tensor(tn(down, "weight", bid), {ff, dim, n}, flags);
+        if (merged) { bank.gate_up = create_tensor(tn(gate_up, "weight", bid), {dim, 2 * ff, n}, flags); }
+        else {
+            bank.gate = create_tensor(tn(gate, "weight", bid), {dim, ff, n}, flags);
+            bank.up = create_tensor(tn(up, "weight", bid), {dim, ff, n}, flags);
+        }
+    };
+    for (llm_tensor role : {LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_UP_EXPS, LLM_TENSOR_FFN_DOWN_EXPS, LLM_TENSOR_FFN_GATE_UP_EXPS}) {
+        if (ml->get_tensor_meta(tn(role, "weight", bid).str().c_str())) { fail("split and unsplit weights coexist"); }
+    }
+    load(layer.hot, true);
+    load(layer.cold, false);
+    if (!layer.hot.ids.empty() && !layer.cold.ids.empty() && bool(layer.hot.gate_up) != bool(layer.cold.gate_up)) {
+        fail("banks must share the gate/up representation");
+    }
+    return true;
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {

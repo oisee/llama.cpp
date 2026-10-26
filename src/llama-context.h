@@ -17,6 +17,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_expert_stats;
 class llama_batch_allocr;
 class llama_moe_cache;
 
@@ -123,6 +124,9 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    bool set_expert_stats_classes(llama_seq_id seq, llama_pos pos0, const uint8_t * classes, int n);
+    void set_expert_stats_paused(bool paused);
+    void expert_stats_request(int request_id, const char * tag_json);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -300,6 +304,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    std::unique_ptr<llama_expert_stats> expert_stats;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

@@ -1914,7 +1914,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && std::max(dst->ne[2], int64_t(ggml_get_op_params_i32(dst, 4))) > get_mmvq_mmid_max_batch(src0->type, cc)) {
         return false;
     }
 
@@ -2040,9 +2040,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
+    const int64_t logical_batch = std::max(dst->ne[2], int64_t(ggml_get_op_params_i32(dst, 4)));
+    if (logical_batch <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+            if (logical_batch <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
@@ -2077,10 +2078,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        const int64_t logical_batch = std::max(ne2, int64_t(ggml_get_op_params_i32(dst, 4)));
+        if (logical_batch <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                if (ne2 <= mmvq_mmid_max) {
+                if (logical_batch <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }

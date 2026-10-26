@@ -1500,6 +1500,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (params.warmup) {
+        llama_expert_stats_pause(lctx, true);
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
         std::vector<llama_token> tmp;
@@ -1536,6 +1537,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
+        llama_expert_stats_pause(lctx, false);
         llama_perf_context_reset(lctx);
 
         // reset samplers to reset RNG state after warmup to the seeded state
@@ -1591,6 +1593,9 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
 
     llama_memory_clear(mem, true);
 
+    // Startup compatibility probes are not corpus tokens.
+    llama_expert_stats_pause(ctx, true);
+
     // eval 2 tokens to check if the context is compatible
     std::vector<llama_token> tmp;
     tmp.push_back(0);
@@ -1619,6 +1624,7 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
 done:
     llama_memory_clear(mem, true);
     llama_synchronize(ctx);
+    llama_expert_stats_pause(ctx, false);
 
     return res;
 }

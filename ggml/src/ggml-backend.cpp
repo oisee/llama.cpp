@@ -1862,6 +1862,23 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+static void ggml_backend_sched_dispatch_marker(ggml_tensor *, int, int, void *) {
+    GGML_ABORT("scheduler dispatch marker requires ggml_backend_sched");
+}
+
+static ggml_backend_sched_dispatch * ggml_backend_sched_get_dispatch(const ggml_tensor * node) {
+    if (node->op != GGML_OP_CUSTOM) { return nullptr; }
+    ggml_custom_op_params params;
+    memcpy(&params, node->op_params, sizeof(params));
+    return params.fun == ggml_backend_sched_dispatch_marker ? static_cast<ggml_backend_sched_dispatch *>(params.userdata) : nullptr;
+}
+
+ggml_tensor * ggml_backend_sched_dispatch_new(ggml_context * ctx, int64_t dim, int64_t k, int64_t tokens,
+        ggml_tensor * activations, ggml_tensor * ids, ggml_backend_sched_dispatch * dispatch) {
+    ggml_tensor * args[] = {activations, ids};
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, dim, k, tokens, 1, args, 2, ggml_backend_sched_dispatch_marker, 1, dispatch);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1896,7 +1913,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        bool has_dispatch = false;
+        for (int j = 0; j < split->graph.n_nodes; ++j) {
+            has_dispatch = has_dispatch || ggml_backend_sched_get_dispatch(split->graph.nodes[j]) != nullptr;
+        }
+        if (!sched->callback_eval && !has_dispatch) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -1906,15 +1927,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
+                if (auto * dispatch = ggml_backend_sched_get_dispatch(t)) {
+                    ggml_backend_synchronize(split_backend);
+                    enum ggml_status ec = dispatch->callback(t, dispatch->user_data);
+                    if (ec != GGML_STATUS_SUCCESS) { return ec; }
+                    if (sched->callback_eval && sched->callback_eval(t, true, sched->callback_eval_user_data) &&
+                            !sched->callback_eval(t, false, sched->callback_eval_user_data)) { break; }
+                    continue;
+                }
                 // check if the user needs data from this node
-                bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                bool need = sched->callback_eval && sched->callback_eval(t, true, sched->callback_eval_user_data);
 
                 int j1 = j0;
 
                 // determine the range [j0, j1] of nodes that can be computed together
                 while (!need && j1 < split->graph.n_nodes - 1) {
+                    if (ggml_backend_sched_get_dispatch(split->graph.nodes[j1 + 1])) { break; }
                     t = split->graph.nodes[++j1];
-                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                    need = sched->callback_eval && sched->callback_eval(t, true, sched->callback_eval_user_data);
                 }
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);

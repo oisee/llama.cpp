@@ -19,6 +19,9 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_expert_tiers;
+struct llama_tier_dispatch;
+struct llama_tier_runtime;
 struct llama_prec_policy;
 struct llama_hadamard;
 
@@ -810,6 +813,7 @@ struct llm_graph_params {
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
+    const std::vector<llama_expert_tiers> * expert_tiers = nullptr;
     const std::map<int, ggml_tensor *> * cnm_router_masks = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -975,6 +979,8 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    std::shared_ptr<llama_tier_runtime> tier_runtime;
+    std::vector<std::shared_ptr<llama_tier_dispatch>> tier_dispatches;
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1069,6 +1075,7 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
+    const std::vector<llama_expert_tiers> * expert_tiers;
     const std::map<int, ggml_tensor *> * cnm_router_masks;
 
     std::map<llama_seq_id, llama_sampler *> samplers;

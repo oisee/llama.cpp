@@ -370,6 +370,18 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
     // Set a callback to be called for each resulting node during graph compute
+    // Scheduler-owned execution boundary. Direct backend execution fails explicitly.
+    typedef enum ggml_status (*ggml_backend_sched_dispatch_callback)(struct ggml_tensor * output, void * user_data);
+    struct ggml_backend_sched_dispatch {
+        ggml_backend_sched_dispatch_callback callback;
+        void * user_data;
+    };
+    GGML_API struct ggml_tensor * ggml_backend_sched_dispatch_new(
+            struct ggml_context * ctx, int64_t dim, int64_t k, int64_t tokens,
+            struct ggml_tensor * activations, struct ggml_tensor * ids,
+            struct ggml_backend_sched_dispatch * dispatch);
+
+    // Set a callback to be called for each resulting node in the graph
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
     // Set a callback to be called when the inputs weights of a split are being copied

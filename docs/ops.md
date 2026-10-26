@@ -131,3 +131,5 @@ Legend:
 |                            TRUNC | ❌ | ❌ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                          UPSCALE | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                            XIELU | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+
+`ggml_mul_mat_id_set_batch_hint()` preserves CUDA MMVQ/MMQ family selection for compact routed-pair batches. It does not add pairs or change the operation's shape or IDs. Other backends may ignore this numerical dispatch hint.

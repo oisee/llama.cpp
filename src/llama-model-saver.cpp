@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <string>
+#include <stdexcept>
 #include <unordered_set>
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
@@ -146,6 +147,10 @@ void llama_model_saver::add_tensor(const struct ggml_tensor * tensor) {
 }
 
 void llama_model_saver::add_kv_from_model() {
+    if (model->tier_metadata) {
+        gguf_set_kv(gguf_ctx, model->tier_metadata.get());
+        return;
+    }
     const llama_hparams & hparams = model->hparams;
     const llama_vocab   & vocab   = model->vocab;
 
@@ -479,6 +484,18 @@ void llama_model_saver::add_kv_from_model() {
 }
 
 void llama_model_saver::add_tensors_from_model() {
+    if (model->tier_metadata) {
+        for (const auto & entry : model->tensors_by_name) {
+            if (!entry.second->data || !ggml_backend_buffer_is_host(entry.second->buffer)) {
+                throw std::runtime_error("expert tiers: portable save requires allocated CPU weights");
+            }
+            if (std::string(ggml_backend_buffer_name(entry.second->buffer)).find("REPACK") != std::string::npos) {
+                throw std::runtime_error("expert tiers: save requires loading with CPU repacking disabled");
+            }
+        }
+        for (const auto & entry : model->tensors_by_name) { add_tensor(entry.second); }
+        return;
+    }
     if (model->output != nullptr &&
             std::string(model->output->name) != std::string(model->tok_embd->name)) {
         add_tensor(model->tok_embd); // some models use the same tensor for tok_embd and output

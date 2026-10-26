@@ -261,6 +261,19 @@ struct llama_layer_switch_lora {
     struct ggml_tensor * b_down = nullptr;
 };
 
+struct llama_expert_bank {
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * up = nullptr;
+    ggml_tensor * down = nullptr;
+    ggml_tensor * gate_up = nullptr;
+    std::vector<int32_t> ids;
+};
+
+struct llama_expert_tiers {
+    bool tiered = false;
+    llama_expert_bank hot, cold;
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -722,6 +735,8 @@ struct llama_model {
     llama_hadamard hdmd;
 
     // Owned constant router-logit masks; empty when CNM_EXPERT_MASK is absent.
+    std::vector<llama_expert_tiers> expert_tiers;
+    gguf_context_ptr tier_metadata;
     std::map<int, ggml_tensor *> cnm_router_masks;
     ggml_context * cnm_mask_ctx = nullptr;
     ggml_backend_buffer_t cnm_mask_buffer = nullptr;
@@ -957,6 +972,8 @@ struct llama_model_base : public llama_model {
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
+    bool create_tensor_expert_tiers(int bid, int64_t dim, int64_t ff, int flags);
+
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
 

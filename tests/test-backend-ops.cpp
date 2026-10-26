@@ -5667,6 +5667,17 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+struct test_mul_mat_id_batch_hint : public test_mul_mat_id {
+    int32_t hint;
+    test_mul_mat_id_batch_hint(ggml_type type, int32_t hint) : test_mul_mat_id(type, GGML_TYPE_F32, 7, 1, true, 32, 1, 256), hint(hint) {}
+    std::string vars() override { return test_mul_mat_id::vars() + ",batch_hint=" + std::to_string(hint); }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * out = test_mul_mat_id::build_graph(ctx);
+        ggml_mul_mat_id_set_batch_hint(out, hint);
+        return out;
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -11026,6 +11037,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+
+    for (auto type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
+        for (int32_t hint : {1, 17, 65}) { test_cases.emplace_back(new test_mul_mat_id_batch_hint(type, hint)); }
+    }
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.

@@ -15,12 +15,259 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <cstdlib>
+#include <cstdio>
+#include <fstream>
+#include <iomanip>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+// Opt-in routing observer. Disabled contexts keep the original scheduler callback.
+struct llama_expert_stats {
+    struct class_stats {
+        uint64_t tokens = 0, missing = 0;
+        std::vector<uint64_t> counts;
+        std::vector<double> weight_sum;
+    };
+    struct layer_stats {
+        class_stats classes[8];
+        std::vector<uint8_t> pending_classes;
+
+        uint64_t tokens[2] = {}, top_k[2] = {};
+        std::vector<uint64_t> counts[2];
+        std::vector<double> weight_sum[2], weight_sum_sq[2];
+        double token_weight_sum[2] = {}, token_weight_sum_sq[2] = {};
+        std::vector<int32_t> pending_ids;
+        int64_t pending_tokens = 0, pending_k = 0;
+        int pending_mode = 0;
+    };
+    const llama_cparams & params;
+    const llama_model & model;
+    const std::string path;
+    const ggml_backend_sched_eval_callback previous;
+    void * const previous_data;
+    bool previous_wants = false;
+    bool paused = false;
+    uint64_t errors = 0, completed = 0;
+    const bool every = std::getenv("CNM_EXPERT_STATS_EVERY") &&
+        std::string(std::getenv("CNM_EXPERT_STATS_EVERY")) == "1";
+    std::map<int, layer_stats> layers;
+    std::vector<uint8_t> scratch;
+    std::map<llama_seq_id, std::map<llama_pos, uint8_t>> position_classes;
+    std::vector<uint8_t> row_classes, output_classes;
+    std::vector<bool> row_missing, output_missing;
+
+    void prepare(const llama_ubatch & ubatch) {
+        row_classes.clear(); output_classes.clear();
+        row_missing.clear(); output_missing.clear();
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            uint8_t cls = 0;
+            bool missing = true;
+            for (int j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                const auto seq = position_classes.find(ubatch.seq_id[i][j]);
+                if (seq == position_classes.end()) continue;
+                const auto pos = seq->second.find(ubatch.pos[i]);
+                if (pos == seq->second.end()) continue;
+                if (!missing && cls != pos->second) ++errors;
+                cls = pos->second;
+                missing = false;
+            }
+            row_classes.push_back(cls); row_missing.push_back(missing);
+            if (ubatch.output[i]) {
+                output_classes.push_back(cls); output_missing.push_back(missing);
+            }
+        }
+    }
+
+
+    llama_expert_stats(const llama_cparams & p, const llama_model & m, const char * file) :
+        params(p), model(m), path(file), previous(p.cb_eval), previous_data(p.cb_eval_user_data) {}
+
+    static bool observe(ggml_tensor * t, bool ask, void * data) {
+        auto & s = *static_cast<llama_expert_stats *>(data);
+        int layer = -1, end = 0;
+        const bool ids = sscanf(t->name, "ffn_moe_topk-%d%n", &layer, &end) == 1 &&
+            t->name[end] == '\0' && layer >= 0;
+        const bool weighted = !ids && sscanf(t->name, "ffn_moe_weighted-%d%n", &layer, &end) == 1 &&
+            t->name[end] == '\0' && layer >= 0;
+        const int n_expert = layer >= 0 && size_t(layer) < s.model.layers.size() && s.model.layers[layer].ffn_gate_inp ? s.model.layers[layer].ffn_gate_inp->ne[1] : 0;
+        const bool selected = !s.paused && !s.params.warmup && (ids || weighted);
+        if (ask) {
+            s.previous_wants = s.previous && s.previous(t, true, s.previous_data);
+            return selected || s.previous_wants;
+        }
+        if (selected) {
+            // A top-k view has a full-expert row stride: do not treat it as packed.
+            try {
+                if (weighted) {
+                    auto & l = s.layers[layer];
+                    // Read the exact weights applied by the existing multiply, not its large output.
+                    ggml_tensor * w = t->src[1];
+                    if (t->op != GGML_OP_MUL || !w || w->type != GGML_TYPE_F32 ||
+                        w->ne[0] != 1 || w->ne[1] != l.pending_k ||
+                        w->ne[2]*w->ne[3] != l.pending_tokens || l.pending_k <= 0 ||
+                        l.pending_ids.size() != size_t(l.pending_k*l.pending_tokens)) {
+                        ++s.errors;
+                        LLAMA_LOG_ERROR("CNM expert stats: unmatched weights layer %d pending k=%" PRId64 " tokens=%" PRId64 " ids=%zu weight shape=%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 " op=%d\n", layer, l.pending_k, l.pending_tokens, l.pending_ids.size(), w ? w->ne[0] : -1, w ? w->ne[1] : -1, w ? w->ne[2] : -1, w ? w->ne[3] : -1, int(t->op));
+                    } else {
+                        const int mode = l.pending_mode;
+                        l.weight_sum[mode].resize(n_expert, 0);
+                        l.weight_sum_sq[mode].resize(n_expert, 0);
+                        s.scratch.resize(ggml_nbytes(w));
+                        ggml_backend_tensor_get(w, s.scratch.data(), 0, s.scratch.size());
+                        size_t index = 0;
+                        size_t row = 0;
+                        for (int64_t i3 = 0; i3 < w->ne[3]; ++i3)
+                        for (int64_t i2 = 0; i2 < w->ne[2]; ++i2) {
+                            auto & cls = l.classes[l.pending_classes.at(row++)];
+                            cls.weight_sum.resize(n_expert, 0);
+                            double row_sum = 0, row_sq = 0;
+                            for (int64_t i1 = 0; i1 < w->ne[1]; ++i1) {
+                                float value;
+                                memcpy(&value, s.scratch.data() + i1*w->nb[1] + i2*w->nb[2] + i3*w->nb[3], sizeof(value));
+                                const int32_t id = l.pending_ids[index++];
+                                if (!std::isfinite(value) || value < 0 || id < 0 || id >= n_expert) {
+                                    ++s.errors;
+                                    continue;
+                                }
+                                const double v = value;
+                                l.weight_sum[mode][id] += v;
+                                cls.weight_sum[id] += v;
+                                l.weight_sum_sq[mode][id] += v*v;
+                                row_sum += v;
+                                row_sq += v*v;
+                            }
+                            l.token_weight_sum[mode] += row_sum;
+                            l.token_weight_sum_sq[mode] += row_sq;
+                        }
+                    }
+                    l.pending_ids.clear();
+                    l.pending_tokens = l.pending_k = 0;
+                } else if (t->type != GGML_TYPE_I32 || t->ne[0] <= 0 || t->ne[0] > n_expert) {
+                    ++s.errors;
+                } else {
+                    const int64_t tokens = t->ne[1]*t->ne[2]*t->ne[3];
+                    const int mode = tokens == 1 ? 1 : 0;
+                    auto & l = s.layers[layer];
+                    if (l.top_k[mode] && l.top_k[mode] != uint64_t(t->ne[0])) {
+                        ++s.errors;
+                    }
+                    if (!l.pending_ids.empty()) { ++s.errors; LLAMA_LOG_ERROR("CNM expert stats: overlapping IDs layer %d pending tokens=%" PRId64 " k=%" PRId64 "\n", layer, l.pending_tokens, l.pending_k); }
+                    l.pending_ids.clear();
+                    const auto & classes = tokens == int64_t(s.row_classes.size()) ? s.row_classes : s.output_classes;
+                    const auto & missing = tokens == int64_t(s.row_classes.size()) ? s.row_missing : s.output_missing;
+                    if (classes.size() != size_t(tokens)) throw std::runtime_error("unmatched ubatch rows");
+                    l.pending_classes = classes;
+                    for (size_t row = 0; row < classes.size(); ++row) {
+                        auto & c = l.classes[classes[row]];
+                        ++c.tokens;
+                        c.missing += missing[row];
+                        c.counts.resize(n_expert, 0);
+                        c.weight_sum.resize(n_expert, 0);
+                    }
+                    l.pending_tokens = tokens;
+                    l.pending_k = t->ne[0];
+                    l.pending_mode = mode;
+                    l.top_k[mode] = t->ne[0];
+                    l.tokens[mode] += tokens;
+                    l.counts[mode].resize(n_expert, 0);
+                    s.scratch.resize(ggml_nbytes(t));
+                    ggml_backend_tensor_get(t, s.scratch.data(), 0, s.scratch.size());
+                    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3)
+                    for (int64_t i2 = 0; i2 < t->ne[2]; ++i2)
+                    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1)
+                    for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                        int32_t id;
+                        memcpy(&id, s.scratch.data() + i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3], sizeof(id));
+                        l.pending_ids.push_back(id);
+                        if (id < 0 || id >= n_expert) {
+                            ++s.errors;
+                        } else {
+                            ++l.counts[mode][id];
+                            const size_t row = i1 + t->ne[1]*(i2 + t->ne[2]*i3);
+                            ++l.classes[l.pending_classes.at(row)].counts[id];
+                        }
+                    }
+                }
+            } catch (const std::exception & e) {
+                ++s.errors;
+                LLAMA_LOG_ERROR("CNM expert stats: %s\n", e.what());
+            }
+        }
+        return !s.previous_wants || s.previous(t, false, s.previous_data);
+    }
+
+    void dump(const std::string & target = "", int request_id = -1, const char * tag_json = "null") const {
+        // Each context needs its own path; callers must stop gracefully to flush.
+        const std::string dest = target.empty() ? path : target;
+        const std::string tmp = dest + ".tmp";
+        std::ofstream out(tmp, std::ios::trunc);
+        if (!out) {
+            LLAMA_LOG_ERROR("CNM expert stats: cannot open %s\n", path.c_str());
+            return;
+        }
+        uint64_t dump_errors = errors;
+        for (const auto & entry : layers) {
+            if (!entry.second.pending_ids.empty()) ++dump_errors;
+        }
+        out << std::setprecision(17);
+        out << "{\"n\":" << completed << ",\"request_id\":" << request_id
+            << ",\"tag\":" << tag_json << ",\"schema\":3,\"mode_rule\":\"ubatch_tokens>1:prompt;else:decode\","
+               "\"warmup_excluded\":true,\"errors\":" << dump_errors << ",\"layers\":{";
+        bool first_layer = true;
+        for (const auto & entry : layers) {
+            if (!first_layer) out << ',';
+            first_layer = false;
+            out << '\"' << entry.first << "\":{";
+            const auto & l = entry.second;
+            const int n_expert = model.layers[entry.first].ffn_gate_inp->ne[1];
+            for (int mode = 0; mode < 2; ++mode) {
+                if (mode) out << ',';
+                out << (mode ? "\"decode\":{" : "\"prompt\":{")
+                    << "\"tokens\":" << l.tokens[mode] << ",\"top_k\":" << l.top_k[mode] << ",\"counts\":[";
+                for (size_t i = 0; i < l.counts[mode].size(); ++i) {
+                    if (i) out << ',';
+                    out << l.counts[mode][i];
+                }
+                out << "],\"weight_sum\":[";
+                for (size_t i = 0; i < l.weight_sum[mode].size(); ++i) {
+                    if (i) out << ',';
+                    out << l.weight_sum[mode][i];
+                }
+                out << "],\"weight_sum_sq\":[";
+                for (size_t i = 0; i < l.weight_sum_sq[mode].size(); ++i) {
+                    if (i) out << ',';
+                    out << l.weight_sum_sq[mode][i];
+                }
+                out << "],\"token_weight_sum\":" << l.token_weight_sum[mode]
+                    << ",\"token_weight_sum_sq\":" << l.token_weight_sum_sq[mode] << '}';
+            }
+            static const char * names[] = {"other", "thinking", "text", "tool_call", "edit_args", "tool_result", "turn_end", "decision"};
+            out << ",\"classes\":{";
+            for (int c = 0; c < 8; ++c) {
+                if (c) out << ',';
+                const auto & v = l.classes[c];
+                out << '\"' << names[c] << "\":{\"tokens\":" << v.tokens << ",\"missing\":" << v.missing << ",\"counts\":[";
+                for (int e = 0; e < n_expert; ++e) { if (e) out << ','; out << (v.counts.empty() ? 0 : v.counts[e]); }
+                out << "],\"weight_sum\":[";
+                for (int e = 0; e < n_expert; ++e) { if (e) out << ','; out << (v.weight_sum.empty() ? 0 : v.weight_sum[e]); }
+                out << "]}";
+            }
+            out << "}}";
+        }
+        out << "}}\n";
+        out.flush();
+        const bool ok = bool(out);
+        out.close();
+        if (!ok || std::rename(tmp.c_str(), dest.c_str()))
+            LLAMA_LOG_ERROR("CNM expert stats: write/rename failed: %s\n", dest.c_str());
+        if (dump_errors) LLAMA_LOG_ERROR("CNM expert stats: INVALID counters (%" PRIu64 " errors)\n", dump_errors);
+    }
+};
 
 //
 // llama_context
@@ -232,6 +479,14 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (const char * path = std::getenv("CNM_EXPERT_STATS")) {
+        if (*path) {
+            expert_stats.reset(new llama_expert_stats(cparams, model, path));
+            cparams.cb_eval = llama_expert_stats::observe;
+            cparams.cb_eval_user_data = expert_stats.get();
+        }
+    }
+
 
     cparams.ctx_other = nullptr;
 
@@ -369,6 +624,9 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    if (cparams.moe_cache_size && std::any_of(model.expert_tiers.begin(), model.expert_tiers.end(), [](const llama_expert_tiers & l) { return l.tiered; })) {
+        throw std::runtime_error("expert tiers conflict with --moe-cache-mib");
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -585,6 +843,7 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (expert_stats) expert_stats->dump();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1391,6 +1650,28 @@ bool llama_context::get_causal_attn() const {
     return cparams.causal_attn;
 }
 
+void llama_context::expert_stats_request(int request_id, const char * tag_json) {
+    if (!expert_stats || !expert_stats->every) return;
+    synchronize(); // server thread serializes completions; drain asynchronous callbacks first
+    ++expert_stats->completed;
+    expert_stats->dump(expert_stats->path + "." + std::to_string(expert_stats->completed) + ".json", request_id, tag_json);
+}
+
+bool llama_context::set_expert_stats_classes(llama_seq_id seq, llama_pos pos0, const uint8_t * classes, int n) {
+    if (n < 0 || pos0 < 0 || n > std::numeric_limits<llama_pos>::max() - pos0 || (n && !classes)) return false;
+    for (int i = 0; i < n; ++i) if (classes[i] > 7) return false;
+    if (!expert_stats) return true;
+    synchronize();
+    auto & positions = expert_stats->position_classes[seq];
+    if (!n) positions.clear();
+    for (int i = 0; i < n; ++i) positions[pos0 + i] = classes[i];
+    return true;
+}
+
+void llama_context::set_expert_stats_paused(bool paused) {
+    if (expert_stats) expert_stats->paused = paused;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1583,6 +1864,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (expert_stats) {
+        synchronize();
+        expert_stats->prepare(ubatch);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -2718,6 +3003,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.expert_tiers =*/ model.expert_tiers.empty() ? nullptr : &model.expert_tiers,
         /*.cnm_router_masks =*/ model.cnm_router_masks.empty() ? nullptr : &model.cnm_router_masks,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -4222,6 +4508,18 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
+}
+
+void llama_expert_stats_request(llama_context * ctx, int request_id, const char * tag_json) {
+    ctx->expert_stats_request(request_id, tag_json);
+}
+
+bool llama_expert_stats_set_classes(llama_context * ctx, llama_seq_id seq, llama_pos pos0, const uint8_t * classes, int n) {
+    return ctx->set_expert_stats_classes(seq, pos0, classes, n);
+}
+
+void llama_expert_stats_pause(llama_context * ctx, bool paused) {
+    ctx->set_expert_stats_paused(paused);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "gguf.h"
 
 #include "json.h"
 #include "log.h"
@@ -182,6 +183,16 @@ static void common_params_fit_impl(
         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+    }
+    for (const char * path : {path_model, extra ? extra->path_model : nullptr}) {
+        if (!path) { continue; }
+        auto * metadata = gguf_init_from_file(path, {true, nullptr});
+        if (!metadata) { throw common_params_fit_exception("cannot read model header for fitting"); }
+        const bool tiered = gguf_find_key(metadata, "cnm.expert_tiers.version") >= 0;
+        gguf_free(metadata);
+        if (tiered) {
+            throw common_params_fit_exception("expert tiers use manifest-selected immutable H; set -fit off and explicit placement/context, or regenerate a smaller tier manifest");
+        }
     }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;

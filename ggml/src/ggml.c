@@ -3435,6 +3435,11 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_batch_hint(struct ggml_tensor * tensor, int32_t tokens) {
+    GGML_ASSERT(tensor->op == GGML_OP_MUL_MAT_ID && tokens > 0);
+    ggml_set_op_params_i32(tensor, 4, tokens);
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

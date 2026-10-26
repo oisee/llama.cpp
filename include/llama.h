@@ -1116,6 +1116,16 @@ extern "C" {
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
+    // Server completion boundary. tag_json must be a JSON string or null.
+    LLAMA_API void llama_expert_stats_request(struct llama_context * ctx, int request_id, const char * tag_json);
+
+    // Absolute attributed positions. n=0 clears the sequence. Invalid input returns false.
+    LLAMA_API bool llama_expert_stats_set_classes(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos0, const uint8_t * classes, int n);
+
+    // Pause only the opt-in CNM routing observer, without changing graph topology.
+    // Call after synchronizing pending evaluation; no-op if statistics are disabled.
+    LLAMA_API void llama_expert_stats_pause(struct llama_context * ctx, bool paused);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //
