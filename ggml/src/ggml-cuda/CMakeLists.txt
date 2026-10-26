@@ -127,6 +127,15 @@ if (CUDAToolkit_FOUND)
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    set(GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC "" CACHE STRING "Override the CUDA bitonic top-k width threshold")
+    if (GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC)
+        if (NOT GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC MATCHES "^[1-9][0-9]*$")
+            message(FATAL_ERROR "GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC must be a positive integer")
+        endif()
+        set_property(SOURCE top-k.cu APPEND PROPERTY COMPILE_DEFINITIONS
+            GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC=${GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC})
+    endif()
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}

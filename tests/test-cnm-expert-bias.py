@@ -4,7 +4,7 @@ import json, os, pathlib, shutil, subprocess, sys
 root=pathlib.Path(sys.argv[1]).resolve()
 exe=root/'moe-trace'; model=root/'tiny.gguf'; work=root/'tiny-tests'
 work.mkdir(exist_ok=True)
-env={k:v for k,v in os.environ.items() if k not in ['CNM_EXPERT_MASK','CNM_EXPERT_BIAS','TRACE_GPU','TRACE_LONG']}
+env={k:v for k,v in os.environ.items() if k not in ['CNM_EXPERT_MASK','CNM_EXPERT_BIAS','TRACE_GPU','TRACE_LONG','TRACE_TOKEN_FILE']}
 env['CUDA_VISIBLE_DEVICES']=''
 def run(name,plan=None,mask=None,expect=True):
     out=work/name;out.mkdir(exist_ok=True)
