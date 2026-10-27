@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -250,6 +251,11 @@ struct llama_moe_cache::impl {
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
+
+    // [CNM] counters readable from any thread (relaxed), see llama_moe_cache::counters
+    std::atomic<uint64_t> c_hits{0}, c_misses{0}, c_bytes{0}, c_sel{0}, c_sel_cold{0};
+    std::atomic<uint64_t> c_pf_uploaded{0}, c_pf_present{0}, c_pf_skipped{0}, c_pf_bytes{0};
+    std::vector<std::vector<uint8_t>> cold; // [n_layer][n_expert] or empty, set by set_cold
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -613,10 +619,156 @@ struct llama_moe_cache::impl {
         st.misses += fills.size();
         st.bytes  += bytes;
 
+        c_hits  .fetch_add(n_hit,        std::memory_order_relaxed);
+        c_misses.fetch_add(fills.size(), std::memory_order_relaxed);
+        c_bytes .fetch_add(bytes,        std::memory_order_relaxed);
+        c_sel   .fetch_add(ids.size(),   std::memory_order_relaxed);
+        if (il < (int32_t) cold.size() && !cold[il].empty()) {
+            size_t n_cold = 0;
+            for (int32_t e : ids) {
+                n_cold += cold[il][e];
+            }
+            c_sel_cold.fetch_add(n_cold, std::memory_order_relaxed);
+        }
+
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
 
         return true;
+    }
+
+    llama_moe_cache::counters get_counters() const {
+        llama_moe_cache::counters c;
+        c.hits        = c_hits       .load(std::memory_order_relaxed);
+        c.misses      = c_misses     .load(std::memory_order_relaxed);
+        c.bytes       = c_bytes      .load(std::memory_order_relaxed);
+        c.sel         = c_sel        .load(std::memory_order_relaxed);
+        c.sel_cold    = c_sel_cold   .load(std::memory_order_relaxed);
+        c.pf_uploaded = c_pf_uploaded.load(std::memory_order_relaxed);
+        c.pf_present  = c_pf_present .load(std::memory_order_relaxed);
+        c.pf_skipped  = c_pf_skipped .load(std::memory_order_relaxed);
+        c.pf_bytes    = c_pf_bytes   .load(std::memory_order_relaxed);
+        for (const group & g : groups) {
+            c.n_slots += g.n_slots;
+        }
+        c.n_groups = groups.size();
+        return c;
+    }
+
+    void set_cold(int32_t il, const float * values, int64_t n) {
+        if (il < 0 || il >= (int32_t) layers.size()) {
+            return;
+        }
+        if (cold.size() != layers.size()) {
+            cold.resize(layers.size());
+        }
+        if (values == nullptr || n <= 0 || std::all_of(values, values + n, [](float v) { return v == 0.0f; })) {
+            cold[il].clear();
+            return;
+        }
+        cold[il].assign(n, 0);
+        for (int64_t e = 0; e < n; ++e) {
+            cold[il][e] = values[e] != 0.0f;
+        }
+    }
+
+    int64_t prefetch(const int32_t * pairs, size_t n_pairs) {
+        struct item { int32_t il; int32_t e; };
+        std::vector<std::vector<item>> per_group(groups.size());
+        std::vector<std::vector<bool>> taken(layers.size());
+        uint64_t n_skipped = 0;
+        for (size_t i = 0; i < n_pairs; ++i) {
+            const int32_t il = pairs[2*i + 0];
+            const int32_t e  = pairs[2*i + 1];
+            if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || groups[layers[il].ig].n_slots == 0) {
+                n_skipped++;
+                continue;
+            }
+            const group & g = groups[layers[il].ig];
+            const int32_t n_expert = g.slru.n_expert;
+            if (e < 0 || e >= n_expert) {
+                throw std::invalid_argument("MoE cache prefetch: expert " + std::to_string(e) + " out of range in layer " + std::to_string(il));
+            }
+            auto & tk = taken[il];
+            if (tk.empty()) {
+                tk.assign(n_expert, false);
+            }
+            auto & list = per_group[layers[il].ig];
+            if (tk[e] || list.size() >= (size_t) g.n_slots) {
+                n_skipped++;
+                continue;
+            }
+            tk[e] = true;
+            list.push_back({ il, e });
+        }
+
+        uint64_t n_uploaded = 0;
+        uint64_t n_present  = 0;
+        uint64_t bytes      = 0;
+        std::vector<bool> pinned;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const auto & list = per_group[ig];
+            if (list.empty()) {
+                continue;
+            }
+            group & g = groups[ig];
+            moe_cache_slru & lru = g.slru;
+            ggml_backend_t backend = devices[g.id].backend;
+            ggml_backend_synchronize(backend);
+
+            // experts of the list that are already cached must not be evicted by the others
+            pinned.assign(g.n_slots, false);
+            for (const item & it : list) {
+                const int32_t s = lru.slot_map[it.il][it.e];
+                if (s >= 0) {
+                    pinned[s] = true;
+                }
+            }
+            // reverse priority order: the first pair is touched last and ends most recently used
+            for (size_t k = list.size(); k-- > 0;) {
+                const item & it = list[k];
+                int32_t * slots = lru.slot_map[it.il];
+                int32_t s = slots[it.e];
+                if (s >= 0) {
+                    lru.touch(s);
+                    n_present++;
+                    continue;
+                }
+                // least recently used unpinned slot, probation first
+                s = -1;
+                for (int segment = 0; segment < 2 && s < 0; ++segment) {
+                    for (int32_t t = lru.head[segment]; t >= 0; t = lru.next[t]) {
+                        if (!pinned[t]) {
+                            s = t;
+                            break;
+                        }
+                    }
+                }
+                GGML_ASSERT(s >= 0 && "MoE cache prefetch: no unpinned slot");
+                if (lru.key_of[s] >= 0) {
+                    lru.slot_map[lru.key_of[s] / lru.n_expert][lru.key_of[s] % lru.n_expert] = -1;
+                }
+                lru.key_of[s] = it.il*lru.n_expert + it.e;
+                slots[it.e] = s;
+                pinned[s] = true;
+                lru.touch(s);
+
+                const layer & l = layers[it.il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + it.e*expert_size, s*expert_size, expert_size);
+                    bytes += expert_size;
+                }
+                n_uploaded++;
+            }
+        }
+
+        c_pf_uploaded.fetch_add(n_uploaded, std::memory_order_relaxed);
+        c_pf_present .fetch_add(n_present,  std::memory_order_relaxed);
+        c_pf_skipped .fetch_add(n_skipped,  std::memory_order_relaxed);
+        c_pf_bytes   .fetch_add(bytes,      std::memory_order_relaxed);
+        return (int64_t) n_uploaded;
     }
 
     void log_stats() const {
@@ -630,6 +782,11 @@ struct llama_moe_cache::impl {
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
+        const uint64_t pf_up = c_pf_uploaded.load(), pf_pr = c_pf_present.load();
+        if (pf_up + pf_pr > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: prefetch: uploaded = %llu, already cached = %llu, skipped = %llu, %.2f MiB\n",
+                (unsigned long long) pf_up, (unsigned long long) pf_pr, (unsigned long long) c_pf_skipped.load(), c_pf_bytes.load()/1024.0/1024.0);
+        }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
@@ -660,6 +817,18 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+llama_moe_cache::counters llama_moe_cache::get_counters() const {
+    return pimpl->get_counters();
+}
+
+int64_t llama_moe_cache::prefetch(const int32_t * il_expert_pairs, size_t n_pairs) {
+    return pimpl->prefetch(il_expert_pairs, n_pairs);
+}
+
+void llama_moe_cache::set_cold(int32_t il, const float * values, int64_t n) {
+    pimpl->set_cold(il, values, n);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

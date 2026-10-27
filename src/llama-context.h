@@ -262,7 +262,17 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // [CNM] see llama_set_expert_bias / llama_moe_cache_prefetch / llama_moe_cache_get_stats
+    int32_t cnm_set_expert_bias(const char * path, float bias);
+    int32_t cnm_load_expert_bias(const char * path, float bias);
+    int64_t cnm_moe_cache_prefetch(const int32_t * il_expert_pairs, size_t n_pairs);
+    int32_t cnm_moe_cache_get_stats(struct llama_moe_cache_stats * out) const;
+
 private:
+    // [CNM] parsed bias plans by "path|bias", so a switch does not reparse the JSON
+    std::map<std::string, std::map<int, std::vector<float>>> cnm_bias_plans;
+    const std::map<int, std::vector<float>> & cnm_bias_plan(const char * path, float bias);
+
     llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(

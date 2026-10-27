@@ -31,6 +31,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_CNM, // [CNM] router bias switch, MoE cache prefetch, stats
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -86,6 +87,11 @@ struct task_params {
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
+
+    // [CNM] switch the router bias profile (and optionally prefetch its experts) before this request's prompt
+    std::string cnm_bias_profile;
+    float       cnm_bias     = NAN; // NAN = the profile's own scalar
+    bool        cnm_prefetch = false;
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
@@ -223,6 +229,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_TTS
     mtmd_helper::gen_audio::inp tts_inp;
+
+    // used by SERVER_TASK_TYPE_CNM: {"op": "bias"|"prefetch"|"stats", ...}
+    json cnm;
 
     server_task() = default;
 
@@ -646,6 +655,11 @@ struct server_task_result_get_lora : server_task_result {
 
 struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
+};
+
+struct server_task_result_cnm : server_task_result {
+    json data;
+    virtual json to_json() override { return data; }
 };
 
 struct server_prompt {

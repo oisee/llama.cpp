@@ -156,6 +156,18 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"] = n_draft_accepted;
     }
 
+    if (cnm_set) {
+        base["cnm_moe_cache"] = {
+            {"hits",        cnm_delta.hits},
+            {"misses",      cnm_delta.misses},
+            {"uploaded_bytes", cnm_delta.bytes},
+            {"selections",  cnm_delta.sel},
+            {"selections_cold", cnm_delta.sel_cold},
+            {"prefetch_uploaded", cnm_delta.pf_uploaded},
+            {"prefetch_present",  cnm_delta.pf_present},
+        };
+    }
+
     return base;
 }
 

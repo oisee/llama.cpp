@@ -419,6 +419,11 @@ struct server_slot_stats {
     int64_t t_prompt_last = 0;
     int64_t t_gen_last    = 0;
 
+    // [CNM] MoE cache counters over this request (delta of llama_moe_cache_get_stats), shared by all slots of the context
+    bool cnm_set = false;
+    llama_moe_cache_stats cnm_base  = {};
+    llama_moe_cache_stats cnm_delta = {};
+
     // can only move one direction: start -> prompt -> gen
     void update_prompt_start() {
         GGML_ASSERT(t_start == 0);
@@ -531,6 +536,11 @@ struct server_metrics {
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
+
+    // [CNM] MoE cache counters (filled when the metrics task runs), bias switches
+    bool cnm_cache = false;
+    llama_moe_cache_stats cnm = {};
+    uint64_t cnm_bias_switches = 0;
 
     void init() {
         t_start = ggml_time_us();

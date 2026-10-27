@@ -3674,6 +3674,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
     add_opt(common_arg(
+        {"--cnm-profiles"}, "DIR",
+        "[CNM EXPERIMENTAL] directory of router bias profiles <name>.json (CNM_EXPERT_BIAS format) and optional "
+        "<name>.prefetch.json expert lists; enables POST /cnm/bias, POST /cnm/prefetch, GET /cnm/stats and the "
+        "request field cnm_bias_profile; bias switching needs CNM_EXPERT_BIAS_RUNTIME=1 (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            if (!fs_is_directory(value)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            params.cnm_profiles_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CNM_PROFILES"));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

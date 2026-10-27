@@ -1637,6 +1637,25 @@ std::string server_task_result_metrics::to_metrics() {
     add_items("counter", counters);
     add_items("gauge",   gauges);
 
+    // [CNM] MoE cache counters, only when the context has a MoE cache
+    if (metrics.cnm_cache) {
+        const auto & c = metrics.cnm;
+        add_items("counter", {
+            { "cnm_moe_cache_hits_total",              "CNM: decode-path distinct experts found in the MoE cache", (double) c.hits },
+            { "cnm_moe_cache_misses_total",            "CNM: decode-path distinct experts uploaded on demand",    (double) c.misses },
+            { "cnm_moe_cache_uploaded_bytes_total",    "CNM: bytes uploaded on demand",                           (double) c.bytes },
+            { "cnm_moe_cache_selections_total",        "CNM: decode-path expert selections",                      (double) c.sel },
+            { "cnm_moe_cache_selections_cold_total",   "CNM: selections of experts biased by the current profile", (double) c.sel_cold },
+            { "cnm_moe_cache_prefetch_uploaded_total", "CNM: experts uploaded by prefetch",                       (double) c.pf_uploaded },
+            { "cnm_moe_cache_prefetch_present_total",  "CNM: prefetched experts that were already cached",        (double) c.pf_present },
+            { "cnm_moe_cache_prefetch_bytes_total",    "CNM: bytes uploaded by prefetch",                         (double) c.pf_bytes },
+            { "cnm_bias_switches_total",               "CNM: router bias profile switches",                       (double) metrics.cnm_bias_switches },
+        });
+        add_items("gauge", {
+            { "cnm_moe_cache_slots", "CNM: MoE cache slots of all groups", (double) c.n_slots },
+        });
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"

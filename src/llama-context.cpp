@@ -560,6 +560,13 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+            // [CNM] count selections of experts biased by the load-time plan as cold
+            std::vector<float> row;
+            for (const auto & entry : model.cnm_router_masks) {
+                row.resize(ggml_nelements(entry.second));
+                ggml_backend_tensor_get(entry.second, row.data(), 0, row.size() * sizeof(float));
+                moe_cache->set_cold(entry.first, row.data(), (int64_t) row.size());
+            }
         }
 
         sched_reserve();
@@ -4230,6 +4237,111 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+//
+// [CNM] runtime router bias and MoE cache prefetch
+//
+
+const std::map<int, std::vector<float>> & llama_context::cnm_bias_plan(const char * path, float bias) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "|%a", bias);
+    const std::string key = std::string(path) + buf;
+    auto it = cnm_bias_plans.find(key);
+    if (it == cnm_bias_plans.end()) {
+        it = cnm_bias_plans.emplace(key, llama_cnm_parse_expert_bias(model, path, bias)).first;
+    }
+    return it->second;
+}
+
+int32_t llama_context::cnm_load_expert_bias(const char * path, float bias) {
+    try {
+        if (path == nullptr || path[0] == '\0') {
+            return 0;
+        }
+        cnm_bias_plan(path, bias);
+        return 0;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return -1;
+    }
+}
+
+int32_t llama_context::cnm_set_expert_bias(const char * path, float bias) {
+    try {
+        static const std::map<int, std::vector<float>> none;
+        const auto & values = (path == nullptr || path[0] == '\0') ? none : cnm_bias_plan(path, bias);
+        synchronize();
+        llama_cnm_write_expert_bias(model, values);
+        if (moe_cache) {
+            for (const auto & entry : model.cnm_router_masks) {
+                const auto row = values.find(entry.first);
+                if (row == values.end()) {
+                    moe_cache->set_cold(entry.first, nullptr, 0);
+                } else {
+                    moe_cache->set_cold(entry.first, row->second.data(), (int64_t) row->second.size());
+                }
+            }
+        }
+        size_t n_cold = 0;
+        for (const auto & row : values) {
+            n_cold += std::count_if(row.second.begin(), row.second.end(), [](float f) { return f != 0.0f; });
+        }
+        LLAMA_LOG_INFO("%s: '%s' bias %g: %zu layers, %zu biased experts\n", __func__, path ? path : "", bias, values.size(), n_cold);
+        return 0;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return -1;
+    }
+}
+
+int64_t llama_context::cnm_moe_cache_prefetch(const int32_t * il_expert_pairs, size_t n_pairs) {
+    if (!moe_cache) {
+        LLAMA_LOG_ERROR("%s: the context has no MoE cache (--moe-cache-mib)\n", __func__);
+        return -1;
+    }
+    try {
+        synchronize();
+        return moe_cache->prefetch(il_expert_pairs, n_pairs);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return -1;
+    }
+}
+
+int32_t llama_context::cnm_moe_cache_get_stats(llama_moe_cache_stats * out) const {
+    if (!moe_cache || out == nullptr) {
+        return -1;
+    }
+    const auto c = moe_cache->get_counters();
+    out->hits        = c.hits;
+    out->misses      = c.misses;
+    out->bytes       = c.bytes;
+    out->sel         = c.sel;
+    out->sel_cold    = c.sel_cold;
+    out->pf_uploaded = c.pf_uploaded;
+    out->pf_present  = c.pf_present;
+    out->pf_skipped  = c.pf_skipped;
+    out->pf_bytes    = c.pf_bytes;
+    out->n_slots     = c.n_slots;
+    out->n_groups    = c.n_groups;
+    return 0;
+}
+
+int32_t llama_set_expert_bias(llama_context * ctx, const char * path, float bias) {
+    return ctx->cnm_set_expert_bias(path, bias);
+}
+
+int32_t llama_load_expert_bias(llama_context * ctx, const char * path, float bias) {
+    return ctx->cnm_load_expert_bias(path, bias);
+}
+
+int64_t llama_moe_cache_prefetch(llama_context * ctx, const int32_t * il_expert_pairs, size_t n_pairs) {
+    return ctx->cnm_moe_cache_prefetch(il_expert_pairs, n_pairs);
+}
+
+int32_t llama_moe_cache_get_stats(const llama_context * ctx, llama_moe_cache_stats * out) {
+    return ctx->cnm_moe_cache_get_stats(out);
 }
 
 float * llama_get_logits(llama_context * ctx) {

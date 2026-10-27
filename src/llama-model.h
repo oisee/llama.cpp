@@ -725,6 +725,8 @@ struct llama_model {
     std::map<int, ggml_tensor *> cnm_router_masks;
     ggml_context * cnm_mask_ctx = nullptr;
     ggml_backend_buffer_t cnm_mask_buffer = nullptr;
+    // CNM_EXPERT_BIAS_RUNTIME=1: every supported MoE layer has an offset vector that llama_set_expert_bias() rewrites
+    bool cnm_bias_runtime = false;
 
     // Reconstructed source-width routers for physical expert cuts.
     std::vector<ggml_context *> cut_router_contexts;
@@ -1019,3 +1021,10 @@ const char * llm_type_name(llm_type type);
 // For internal test use
 // TODO: remove
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+
+// CNM: parse a CNM_EXPERT_BIAS plan into per-layer offsets (throws std::runtime_error)
+// scalar_override: NaN keeps the plan's scalar bias, otherwise replaces it for ID arrays
+std::map<int, std::vector<float>> llama_cnm_parse_expert_bias(const llama_model & model, const std::string & path, float scalar_override);
+
+// CNM: write offsets to the router offset tensors, layers missing from values become zero (throws std::runtime_error)
+void llama_cnm_write_expert_bias(const llama_model & model, const std::map<int, std::vector<float>> & values);

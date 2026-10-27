@@ -498,6 +498,13 @@ task_params eval_llama_cmpl_schema(
         f->eval(ctx, data);
     }
 
+    // [CNM] router bias profile for this request (see --cnm-profiles)
+    params.cnm_bias_profile = json_value(data, "cnm_bias_profile", std::string());
+    if (data.contains("cnm_bias") && data.at("cnm_bias").is_number()) {
+        params.cnm_bias = data.at("cnm_bias").get<float>();
+    }
+    params.cnm_prefetch = json_value(data, "cnm_prefetch", false);
+
     // debugging
     {
         auto budget = params.sampling.reasoning_budget_tokens;

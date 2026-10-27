@@ -139,18 +139,14 @@ static void cnm_apply_expert_mask(llama_model_base & model) {
     LLAMA_LOG_INFO("CNM_EXPERT_MASK: canonical sha256 %s\n", hash_sha256_hex(encoded.data(), encoded.size()).c_str());
 }
 
-// Use the mask tensor path so a cold -inf bias has the same graph as a hard mask.
-static void cnm_apply_expert_bias(llama_model_base & model) {
-    const char * path = std::getenv("CNM_EXPERT_BIAS");
-    if (!path) { return; }
-    auto fail = [](const std::string & why) { throw std::runtime_error("CNM_EXPERT_BIAS: " + why); };
-    if (std::getenv("CNM_EXPERT_MASK")) { fail("cannot combine with CNM_EXPERT_MASK"); }
-    if (model.arch != LLM_ARCH_QWEN4EXP || model.hparams.n_expert_groups > 1 || !model.cnm_router_masks.empty()) {
-        fail("requires uncut qwen4exp with ungrouped softmax routing");
-    }
+// Parse a CNM_EXPERT_BIAS plan into per-layer F32 offsets. Throws std::runtime_error with the given prefix.
+// scalar_override: if not NaN, replaces the plan's scalar "bias" for ID arrays (and allows ID arrays without one).
+static std::map<int, std::vector<float>> cnm_parse_expert_bias(const llama_model & model, const std::string & path,
+        float scalar_override, const std::string & prefix, std::string * sha256 = nullptr) {
+    auto fail = [&](const std::string & why) { throw std::runtime_error(prefix + ": " + why); };
     using json = nlohmann::ordered_json;
     std::ifstream input(path);
-    if (!input) { fail("cannot open JSON: " + std::string(path)); }
+    if (!input) { fail("cannot open JSON: " + path); }
     std::vector<std::set<std::string>> keys;
     auto callback = [&](int, json::parse_event_t event, json & value) {
         if (event == json::parse_event_t::object_start) { keys.emplace_back(); }
@@ -173,7 +169,10 @@ static void cnm_apply_expert_bias(llama_model_base & model) {
         if (!std::isfinite(d) || !std::isfinite(f) || d > 0) { fail("bias must be finite, representable and nonpositive"); }
         return f;
     };
-    const float scalar = plan.contains("bias") ? parse_bias(plan["bias"]) : 0.0f;
+    const bool has_override = !std::isnan(scalar_override);
+    if (has_override && scalar_override > 0) { fail("bias override must be nonpositive"); }
+    const bool has_scalar = has_override || plan.contains("bias");
+    const float scalar = has_override ? scalar_override : (plan.contains("bias") ? parse_bias(plan["bias"]) : 0.0f);
     auto parse_id = [&](const std::string & key, size_t limit) -> int {
         if (!std::regex_match(key, std::regex("0|[1-9][0-9]*"))) { fail("invalid index: " + key); }
         unsigned long long id = 0;
@@ -191,7 +190,7 @@ static void cnm_apply_expert_bias(llama_model_base & model) {
         auto & row = values[il];
         row.resize(model.hparams.n_expert(il), 0.0f);
         if (it.value().is_array()) {
-            if (!plan.contains("bias")) { fail("ID arrays require scalar bias"); }
+            if (!has_scalar) { fail("ID arrays require scalar bias"); }
             std::set<int> seen;
             for (const auto & e : it.value()) {
                 if (!e.is_number_integer() || e.get<double>() < 0 || e.get<double>() >= row.size()) { fail("invalid expert ID"); }
@@ -206,15 +205,55 @@ static void cnm_apply_expert_bias(llama_model_base & model) {
             fail("fewer than top_k finite experts");
         }
     }
+    if (sha256) {
+        const std::string encoded = plan.dump();
+        *sha256 = hash_sha256_hex(encoded.data(), encoded.size());
+    }
+    return values;
+}
+
+// MoE layers whose router accepts a CNM offset vector (same test as the parser).
+static bool cnm_bias_layer_supported(const llama_model & model, int il) {
+    const auto & layer = model.layers[il];
+    return layer.ffn_gate_inp && !layer.ffn_exp_probs_b && !layer.ffn_router_mask &&
+        layer.ffn_gate_inp->ne[1] == model.hparams.n_expert(il);
+}
+
+// Use the mask tensor path so a cold -inf bias has the same graph as a hard mask.
+// CNM_EXPERT_BIAS_RUNTIME=1 (opt-in) allocates an offset vector for every supported MoE layer, zero unless the
+// load-time plan sets it, so llama_set_expert_bias() can switch plans without rebuilding the graph. Adding zero
+// leaves finite logits unchanged, but the graph gains one add per layer.
+static void cnm_apply_expert_bias(llama_model_base & model) {
+    const char * path = std::getenv("CNM_EXPERT_BIAS");
+    const char * runtime_env = std::getenv("CNM_EXPERT_BIAS_RUNTIME");
+    const bool runtime = runtime_env && std::string(runtime_env) == "1";
+    if (!path && !runtime) { return; }
+    auto fail = [](const std::string & why) { throw std::runtime_error("CNM_EXPERT_BIAS: " + why); };
+    if (std::getenv("CNM_EXPERT_MASK")) { fail("cannot combine with CNM_EXPERT_MASK"); }
+    if (model.arch != LLM_ARCH_QWEN4EXP || model.hparams.n_expert_groups > 1 || !model.cnm_router_masks.empty()) {
+        fail("requires uncut qwen4exp with ungrouped softmax routing");
+    }
+    std::string sha;
+    std::map<int, std::vector<float>> values;
+    if (path) {
+        values = cnm_parse_expert_bias(model, path, NAN, "CNM_EXPERT_BIAS", &sha);
+    }
+    if (runtime) {
+        for (int il = 0; il < int(model.layers.size()); ++il) {
+            if (cnm_bias_layer_supported(model, il) && !values.count(il)) {
+                values[il].assign(model.hparams.n_expert(il), 0.0f);
+            }
+        }
+    }
     size_t n = 0;
     for (const auto & row : values) {
-        if (std::any_of(row.second.begin(), row.second.end(), [](float f) { return f != 0; })) { ++n; }
+        if (runtime || std::any_of(row.second.begin(), row.second.end(), [](float f) { return f != 0; })) { ++n; }
     }
     if (n) {
         model.cnm_mask_ctx = ggml_init({n * ggml_tensor_overhead(), nullptr, true});
         if (!model.cnm_mask_ctx) { fail("cannot allocate context"); }
         for (const auto & row : values) {
-            if (std::none_of(row.second.begin(), row.second.end(), [](float f) { return f != 0; })) { continue; }
+            if (!runtime && std::none_of(row.second.begin(), row.second.end(), [](float f) { return f != 0; })) { continue; }
             auto * tensor = ggml_new_tensor_1d(model.cnm_mask_ctx, GGML_TYPE_F32, row.second.size());
             ggml_set_name(tensor, ("cnm_router_mask-" + std::to_string(row.first)).c_str());
             model.cnm_router_masks.emplace(row.first, tensor);
@@ -227,9 +266,46 @@ static void cnm_apply_expert_bias(llama_model_base & model) {
             ggml_backend_tensor_set(row.second, data.data(), 0, data.size() * sizeof(float));
         }
     }
-    const std::string encoded = plan.dump();
-    LLAMA_LOG_INFO("CNM_EXPERT_BIAS: %zu layers, %zu nonzero vectors, plan sha256 %s\n", values.size(), n,
-                   hash_sha256_hex(encoded.data(), encoded.size()).c_str());
+    model.cnm_bias_runtime = runtime;
+    if (path) {
+        LLAMA_LOG_INFO("CNM_EXPERT_BIAS: %zu layers, %zu offset vectors%s, plan sha256 %s\n", values.size(), n,
+                       runtime ? " (runtime switching enabled)" : "", sha.c_str());
+    } else {
+        LLAMA_LOG_INFO("CNM_EXPERT_BIAS_RUNTIME: %zu zero offset vectors, runtime switching enabled\n", n);
+    }
+}
+
+std::map<int, std::vector<float>> llama_cnm_parse_expert_bias(const llama_model & model, const std::string & path, float scalar_override) {
+    if (model.arch != LLM_ARCH_QWEN4EXP || model.hparams.n_expert_groups > 1) {
+        throw std::runtime_error("llama_set_expert_bias: requires uncut qwen4exp with ungrouped softmax routing");
+    }
+    return cnm_parse_expert_bias(model, path, scalar_override, "llama_set_expert_bias");
+}
+
+void llama_cnm_write_expert_bias(const llama_model & model, const std::map<int, std::vector<float>> & values) {
+    if (!model.cnm_bias_runtime) {
+        throw std::runtime_error("llama_set_expert_bias: load the model with CNM_EXPERT_BIAS_RUNTIME=1");
+    }
+    // validate everything before writing a single tensor
+    for (const auto & row : values) {
+        const auto found = model.cnm_router_masks.find(row.first);
+        if (found == model.cnm_router_masks.end()) {
+            throw std::runtime_error("llama_set_expert_bias: no offset tensor for layer " + std::to_string(row.first));
+        }
+        if (int64_t(row.second.size()) != ggml_nelements(found->second)) {
+            throw std::runtime_error("llama_set_expert_bias: wrong vector size for layer " + std::to_string(row.first));
+        }
+    }
+    std::vector<float> zeros;
+    for (const auto & entry : model.cnm_router_masks) {
+        const auto row = values.find(entry.first);
+        if (row != values.end()) {
+            ggml_backend_tensor_set(entry.second, row->second.data(), 0, row->second.size() * sizeof(float));
+        } else {
+            zeros.assign(ggml_nelements(entry.second), 0.0f);
+            ggml_backend_tensor_set(entry.second, zeros.data(), 0, zeros.size() * sizeof(float));
+        }
+    }
 }
 
 // Keep the router's matrix and reduction dimensions independent of the cut.

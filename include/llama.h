@@ -1132,6 +1132,45 @@ extern "C" {
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
+    //
+    // [CNM EXPERIMENTAL] runtime router bias and MoE cache prefetch
+    //
+
+    // Replace the router-logit offsets of all MoE layers with a plan in the CNM_EXPERT_BIAS JSON format.
+    // The offsets belong to the model: every context of the model sees the change, including running slots.
+    // path: plan file; NULL or "" resets all offsets to zero.
+    // bias: NAN keeps the plan's scalar "bias", otherwise it replaces the scalar for ID arrays (must be <= 0).
+    // Requires the model to be loaded with CNM_EXPERT_BIAS_RUNTIME=1. Parsed plans are cached by (path, bias).
+    // Synchronizes ctx; call between decodes. Returns 0 on success, -1 on error (logged, offsets unchanged).
+    LLAMA_API int32_t llama_set_expert_bias(struct llama_context * ctx, const char * path, float bias);
+
+    // Parse and cache a plan without applying it (validation at startup). Returns 0 on success, -1 on error.
+    LLAMA_API int32_t llama_load_expert_bias(struct llama_context * ctx, const char * path, float bias);
+
+    // Upload experts into the MoE cache (--moe-cache-mib) and mark them most recently used.
+    // il_expert_pairs: n_pairs pairs (layer, expert) in priority order, the first is the most important;
+    // at most the number of slots of a cache group is taken, the rest is skipped. Synchronizes ctx; call between decodes.
+    // Returns the number of uploaded experts (already cached ones are only promoted), -1 if ctx has no MoE cache or on error.
+    LLAMA_API int64_t llama_moe_cache_prefetch(struct llama_context * ctx, const int32_t * il_expert_pairs, size_t n_pairs);
+
+    // cumulative MoE cache counters since the context was created; decode path = ubatches of at most 32 tokens
+    struct llama_moe_cache_stats {
+        uint64_t hits;        // distinct experts per ubatch and layer found in the cache
+        uint64_t misses;      // distinct experts per ubatch and layer uploaded on demand
+        uint64_t bytes;       // bytes uploaded on demand
+        uint64_t sel;         // expert selections (top-k entries)
+        uint64_t sel_cold;    // selections of experts with a nonzero offset in the current CNM bias
+        uint64_t pf_uploaded; // experts uploaded by llama_moe_cache_prefetch
+        uint64_t pf_present;  // prefetched experts that were already cached
+        uint64_t pf_skipped;  // prefetch pairs skipped (uncached layer, duplicate, over the slots)
+        uint64_t pf_bytes;    // bytes uploaded by prefetch
+        uint64_t n_slots;     // cache slots of all groups
+        uint64_t n_groups;    // cache groups (layers of a device with the same expert layout)
+    };
+
+    // Safe to call from any thread. Returns 0 and fills out, -1 if ctx has no MoE cache.
+    LLAMA_API int32_t llama_moe_cache_get_stats(const struct llama_context * ctx, struct llama_moe_cache_stats * out);
+
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
     // in the order they have appeared in the batch.

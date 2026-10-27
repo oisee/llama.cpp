@@ -1067,6 +1067,16 @@ private:
 
     server_batch batch;
 
+    // [CNM] router bias profiles and prefetch lists from --cnm-profiles
+    struct cnm_profile {
+        std::string path;              // <dir>/<name>.json
+        std::vector<int32_t> prefetch; // (layer, expert) pairs, rank-interleaved across layers
+    };
+    std::map<std::string, cnm_profile> cnm_profiles;
+    std::string cnm_bias_name;       // current profile, "" = load-time state, "none" = zero
+    float       cnm_bias_value = NAN;
+    uint64_t    cnm_bias_switches = 0;
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -1312,6 +1322,10 @@ private:
         }
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        if (!params_base.cnm_profiles_dir.empty() && !cnm_load_profiles(params_base.cnm_profiles_dir)) {
+            return false;
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1925,6 +1939,31 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // [CNM] the bias is model-global: it also changes the routing of other running slots
+        if (!task.params.cnm_bias_profile.empty()) {
+            if (params_base.cnm_profiles_dir.empty()) {
+                send_error(task, "cnm_bias_profile requires --cnm-profiles", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            try {
+                for (const auto & other : slots) {
+                    if (other.id != slot.id && other.is_processing() && task.params.cnm_bias_profile != cnm_bias_name) {
+                        SLT_WRN(slot, "cnm: switching the bias to '%s' while slot %d is processing\n", task.params.cnm_bias_profile.c_str(), other.id);
+                    }
+                }
+                cnm_set_bias(task.params.cnm_bias_profile, task.params.cnm_bias);
+                if (task.params.cnm_prefetch) {
+                    const auto it = cnm_profiles.find(task.params.cnm_bias_profile);
+                    if (it != cnm_profiles.end() && !it->second.prefetch.empty()) {
+                        cnm_prefetch(it->second.prefetch);
+                    }
+                }
+            } catch (const std::exception & e) {
+                send_error(task, std::string("cnm: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2077,6 +2116,7 @@ private:
             slot.sampled = LLAMA_TOKEN_NULL;
             slot.i_batch = -1;
             slot.stats.update_prompt_start();
+            cnm_stats_begin(slot);
             slot.state = SLOT_STATE_GENERATING;
             send_partial_response(slot, {}, false, true);
         }
@@ -2336,6 +2376,7 @@ private:
 
         // populate timings if this is final response or timings_per_token is enabled
         if (slot.stop != STOP_TYPE_NONE || slot.task->params.timings_per_token) {
+            cnm_stats_update(slot);
             res->stats = slot.stats;
         }
 
@@ -2375,6 +2416,7 @@ private:
             res->content     = std::move(slot.generated);
             res->tokens      = std::move(slot.generated_tokens);
         }
+        cnm_stats_update(slot);
         res->stats           = slot.stats;
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
@@ -2944,10 +2986,235 @@ private:
         return n_read;
     }
 
+    //
+    // [CNM] runtime router bias and MoE cache prefetch
+    //
+
+    static bool cnm_valid_name(const std::string & name) {
+        if (name.empty() || name.size() > 64) {
+            return false;
+        }
+        for (char c : name) {
+            if (!(std::isalnum((unsigned char) c) || c == '_' || c == '-' || c == '.')) {
+                return false;
+            }
+        }
+        return name.find("..") == std::string::npos;
+    }
+
+    // {"layers": {"<il>": [experts by priority]}} or {"pairs": [[il, e], ...]}; layers are interleaved by rank
+    static std::vector<int32_t> cnm_parse_prefetch(const json & j) {
+        std::vector<int32_t> pairs;
+        if (j.contains("pairs")) {
+            for (const auto & p : j.at("pairs")) {
+                if (!p.is_array() || p.size() != 2) {
+                    throw std::invalid_argument("pairs must be [[layer, expert], ...]");
+                }
+                pairs.push_back(p[0].get<int32_t>());
+                pairs.push_back(p[1].get<int32_t>());
+            }
+            return pairs;
+        }
+        if (!j.contains("layers") || !j.at("layers").is_object()) {
+            throw std::invalid_argument("expected {\"layers\": {\"<layer>\": [experts]}} or {\"pairs\": [[layer, expert], ...]}");
+        }
+        std::vector<std::pair<int32_t, std::vector<int32_t>>> rows;
+        size_t n_max = 0;
+        for (const auto & [key, ids] : j.at("layers").items()) {
+            rows.emplace_back(std::stoi(key), ids.get<std::vector<int32_t>>());
+            n_max = std::max(n_max, rows.back().second.size());
+        }
+        for (size_t r = 0; r < n_max; ++r) {
+            for (const auto & row : rows) {
+                if (r < row.second.size()) {
+                    pairs.push_back(row.first);
+                    pairs.push_back(row.second[r]);
+                }
+            }
+        }
+        return pairs;
+    }
+
+    bool cnm_load_profiles(const std::string & dir) {
+        namespace fs = std::filesystem;
+        try {
+            for (const auto & entry : fs::directory_iterator(dir)) {
+                const std::string file = entry.path().filename().string();
+                const std::string suffix = ".json";
+                const std::string suffix_pf = ".prefetch.json";
+                if (!entry.is_regular_file() || file.size() <= suffix.size() || file.compare(file.size() - suffix.size(), suffix.size(), suffix) != 0) {
+                    continue;
+                }
+                const bool is_pf = file.size() > suffix_pf.size() && file.compare(file.size() - suffix_pf.size(), suffix_pf.size(), suffix_pf) == 0;
+                const std::string name = file.substr(0, file.size() - (is_pf ? suffix_pf.size() : suffix.size()));
+                if (!cnm_valid_name(name) || name == "none") {
+                    SRV_WRN("cnm: skipping profile file with an invalid name: %s\n", file.c_str());
+                    continue;
+                }
+                auto & prof = cnm_profiles[name];
+                if (is_pf) {
+                    std::ifstream f(entry.path());
+                    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                    prof.prefetch = cnm_parse_prefetch(json::parse(text));
+                } else {
+                    prof.path = entry.path().string();
+                    if (llama_load_expert_bias(ctx_tgt, prof.path.c_str(), NAN) != 0) {
+                        SRV_ERR("cnm: invalid bias profile %s\n", prof.path.c_str());
+                        return false;
+                    }
+                }
+            }
+        } catch (const std::exception & e) {
+            SRV_ERR("cnm: failed to load profiles from %s: %s\n", dir.c_str(), e.what());
+            return false;
+        }
+        for (const auto & [name, prof] : cnm_profiles) {
+            SRV_INF("cnm: profile '%s': bias %s, prefetch %zu pairs\n", name.c_str(), prof.path.empty() ? "-" : "yes", prof.prefetch.size()/2);
+        }
+        return true;
+    }
+
+    // switch the bias to a profile ("none" = all zero); bias NAN = the profile's scalar; throws on error
+    json cnm_set_bias(const std::string & name, float bias) {
+        const char * path = nullptr;
+        if (name != "none") {
+            const auto it = cnm_profiles.find(name);
+            if (it == cnm_profiles.end() || it->second.path.empty()) {
+                throw std::invalid_argument("unknown bias profile: " + name);
+            }
+            path = it->second.path.c_str();
+        }
+        const bool same = name == cnm_bias_name &&
+            ((std::isnan(bias) && std::isnan(cnm_bias_value)) || bias == cnm_bias_value);
+        if (!same) {
+            const int64_t t0 = ggml_time_us();
+            if (llama_set_expert_bias(ctx_tgt, path, bias) != 0) {
+                throw std::runtime_error("llama_set_expert_bias failed for profile " + name + " (is CNM_EXPERT_BIAS_RUNTIME=1 set?)");
+            }
+            cnm_bias_name  = name;
+            cnm_bias_value = bias;
+            cnm_bias_switches++;
+            SRV_INF("cnm: bias profile '%s' (bias %g) in %.2f ms\n", name.c_str(), bias, (ggml_time_us() - t0)/1000.0);
+        }
+        return json{{"profile", cnm_bias_name}, {"bias", std::isnan(cnm_bias_value) ? json(nullptr) : json(cnm_bias_value)}, {"changed", !same}};
+    }
+
+    json cnm_prefetch(const std::vector<int32_t> & pairs) {
+        llama_moe_cache_stats before = {};
+        llama_moe_cache_stats after  = {};
+        if (llama_moe_cache_get_stats(ctx_tgt, &before) != 0) {
+            throw std::runtime_error("the context has no MoE cache (--moe-cache-mib)");
+        }
+        const int64_t t0 = ggml_time_us();
+        const int64_t n = llama_moe_cache_prefetch(ctx_tgt, pairs.data(), pairs.size()/2);
+        if (n < 0) {
+            throw std::runtime_error("llama_moe_cache_prefetch failed");
+        }
+        llama_moe_cache_get_stats(ctx_tgt, &after);
+        const double ms = (ggml_time_us() - t0)/1000.0;
+        SRV_INF("cnm: prefetch %zu pairs: uploaded %lld, present %llu, skipped %llu, %.2f MiB in %.2f ms\n", pairs.size()/2, (long long) n,
+                (unsigned long long) (after.pf_present - before.pf_present), (unsigned long long) (after.pf_skipped - before.pf_skipped),
+                (after.pf_bytes - before.pf_bytes)/1024.0/1024.0, ms);
+        return json{
+            {"pairs",    pairs.size()/2},
+            {"uploaded", after.pf_uploaded - before.pf_uploaded},
+            {"present",  after.pf_present  - before.pf_present},
+            {"skipped",  after.pf_skipped  - before.pf_skipped},
+            {"bytes",    after.pf_bytes    - before.pf_bytes},
+            {"ms",       ms},
+        };
+    }
+
+    json cnm_stats_json() const {
+        json res = {
+            {"profile",  cnm_bias_name},
+            {"bias",     std::isnan(cnm_bias_value) ? json(nullptr) : json(cnm_bias_value)},
+            {"switches", cnm_bias_switches},
+        };
+        json profiles = json::object();
+        for (const auto & [name, prof] : cnm_profiles) {
+            profiles[name] = {{"bias", !prof.path.empty()}, {"prefetch_pairs", prof.prefetch.size()/2}};
+        }
+        res["profiles"] = profiles;
+        llama_moe_cache_stats c = {};
+        if (llama_moe_cache_get_stats(ctx_tgt, &c) == 0) {
+            res["moe_cache"] = {
+                {"hits", c.hits}, {"misses", c.misses}, {"uploaded_bytes", c.bytes},
+                {"selections", c.sel}, {"selections_cold", c.sel_cold},
+                {"prefetch_uploaded", c.pf_uploaded}, {"prefetch_present", c.pf_present},
+                {"prefetch_skipped", c.pf_skipped}, {"prefetch_bytes", c.pf_bytes},
+                {"slots", c.n_slots}, {"groups", c.n_groups},
+            };
+        }
+        return res;
+    }
+
+    // op "bias": {profile, bias?, prefetch?}; op "prefetch": {profile} or {layers} or {pairs}; op "stats"
+    json cnm_handle(const json & req) {
+        const std::string op = json_value(req, "op", std::string());
+        if (op == "stats") {
+            return cnm_stats_json();
+        }
+        if (op == "bias") {
+            const std::string name = json_value(req, "profile", std::string());
+            const float bias = req.contains("bias") && !req.at("bias").is_null() ? req.at("bias").get<float>() : NAN;
+            json res = cnm_set_bias(name, bias);
+            if (json_value(req, "prefetch", false)) {
+                const auto it = cnm_profiles.find(name);
+                if (it == cnm_profiles.end() || it->second.prefetch.empty()) {
+                    throw std::invalid_argument("profile has no prefetch list: " + name);
+                }
+                res["prefetch"] = cnm_prefetch(it->second.prefetch);
+            }
+            return res;
+        }
+        if (op == "prefetch") {
+            if (req.contains("profile")) {
+                const std::string name = req.at("profile").get<std::string>();
+                const auto it = cnm_profiles.find(name);
+                if (it == cnm_profiles.end() || it->second.prefetch.empty()) {
+                    throw std::invalid_argument("profile has no prefetch list: " + name);
+                }
+                return cnm_prefetch(it->second.prefetch);
+            }
+            return cnm_prefetch(cnm_parse_prefetch(req));
+        }
+        throw std::invalid_argument("unknown cnm op: " + op);
+    }
+
+    void cnm_stats_begin(server_slot & slot) {
+        llama_moe_cache_stats c = {};
+        if (llama_moe_cache_get_stats(ctx_tgt, &c) == 0) {
+            slot.stats.cnm_set  = true;
+            slot.stats.cnm_base = c;
+        }
+    }
+
+    void cnm_stats_update(server_slot & slot) {
+        llama_moe_cache_stats c = {};
+        if (!slot.stats.cnm_set || llama_moe_cache_get_stats(ctx_tgt, &c) != 0) {
+            return;
+        }
+        const auto & b = slot.stats.cnm_base;
+        auto & d = slot.stats.cnm_delta;
+        d.hits        = c.hits        - b.hits;
+        d.misses      = c.misses      - b.misses;
+        d.bytes       = c.bytes       - b.bytes;
+        d.sel         = c.sel         - b.sel;
+        d.sel_cold    = c.sel_cold    - b.sel_cold;
+        d.pf_uploaded = c.pf_uploaded - b.pf_uploaded;
+        d.pf_present  = c.pf_present  - b.pf_present;
+        d.pf_skipped  = c.pf_skipped  - b.pf_skipped;
+        d.pf_bytes    = c.pf_bytes    - b.pf_bytes;
+        d.n_slots     = c.n_slots;
+        d.n_groups    = c.n_groups;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        const bool cnm_read_only = task.type == SERVER_TASK_TYPE_CNM && json_value(task.cnm, "op", std::string()) == "stats";
+        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET && !cnm_read_only) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
@@ -3110,6 +3377,8 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+                    res->metrics.cnm_cache   = llama_moe_cache_get_stats(ctx_tgt, &res->metrics.cnm) == 0;
+                    res->metrics.cnm_bias_switches = cnm_bias_switches;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -3333,6 +3602,17 @@ private:
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
                     queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_CNM:
+                {
+                    try {
+                        auto res = std::make_unique<server_task_result_cnm>();
+                        res->id   = task.id;
+                        res->data = cnm_handle(task.cnm);
+                        queue_results.send(std::move(res));
+                    } catch (const std::exception & e) {
+                        send_error(task, std::string("cnm: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    }
                 } break;
         }
 
@@ -3905,6 +4185,7 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
+                        cnm_stats_begin(slot);
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -5764,6 +6045,44 @@ void server_routes::init_routes() {
         }
         return res;
     };
+
+    // [CNM] /cnm/bias, /cnm/prefetch, /cnm/stats
+    auto cnm_route = [this](const std::string & op) {
+        return [this, op](const server_http_req & req) {
+            auto res = create_response();
+            if (params.cnm_profiles_dir.empty()) {
+                res->error(format_error_response("This server does not support the cnm endpoints. Start it with `--cnm-profiles DIR`", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+            json body = req.body.empty() ? json::object() : json::parse(req.body);
+            if (!body.is_object()) {
+                res->error(format_error_response("Request body must be an object", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            body["op"] = op;
+            auto & rd = res->rd;
+            {
+                server_task task(SERVER_TASK_TYPE_CNM);
+                task.id  = rd.get_new_id();
+                task.cnm = std::move(body);
+                rd.post_task(std::move(task), true); // high priority: runs before queued completions
+            }
+            auto result = rd.next(req.should_stop);
+            if (!result) {
+                GGML_ASSERT(req.should_stop());
+                return res;
+            }
+            if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            }
+            res->ok(result->to_json());
+            return res;
+        };
+    };
+    this->post_cnm_bias     = cnm_route("bias");
+    this->post_cnm_prefetch = cnm_route("prefetch");
+    this->get_cnm_stats     = cnm_route("stats");
 
     this->post_props = [this](const server_http_req &) {
         auto res = create_response();

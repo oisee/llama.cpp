@@ -264,6 +264,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
+        routes.post_cnm_bias               = models_routes->proxy_post;
+        routes.post_cnm_prefetch           = models_routes->proxy_post;
+        routes.get_cnm_stats               = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
 
         // custom routes for router
@@ -321,6 +324,10 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    // [CNM] runtime router bias profile, MoE cache prefetch and counters (--cnm-profiles)
+    ctx_http.post("/cnm/bias",                 ex_wrapper(routes.post_cnm_bias));
+    ctx_http.post("/cnm/prefetch",             ex_wrapper(routes.post_cnm_prefetch));
+    ctx_http.get ("/cnm/stats",                ex_wrapper(routes.get_cnm_stats));
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h

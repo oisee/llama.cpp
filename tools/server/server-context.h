@@ -161,6 +161,9 @@ struct server_routes {
     server_http_context::handler_t post_systemone;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    server_http_context::handler_t post_cnm_bias;     // [CNM]
+    server_http_context::handler_t post_cnm_prefetch; // [CNM]
+    server_http_context::handler_t get_cnm_stats;     // [CNM]
 
     // to be used in router mode
     json get_model_info() const;
