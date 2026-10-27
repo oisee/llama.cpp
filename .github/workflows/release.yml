@@ -4,28 +4,10 @@ on:
   workflow_dispatch: # allows manual triggering
     inputs:
       create_release:
-        description: 'Create new release'
+        description: 'Reserved; this workflow only builds artifacts'
+        default: false
         required: true
         type: boolean
-  push:
-    branches:
-      - cnm/release-v0.1
-    paths: [
-      '.github/workflows/release.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp',
-      '**/*.glsl'
-    ]
 
 cache-mode: write
 permissions:
@@ -46,9 +28,6 @@ jobs:
   check-release:
     runs-on: ubuntu-slim
 
-    permissions:
-      contents: write
-
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
       tag_name: ${{ steps.tag.outputs.name }}
@@ -58,17 +37,7 @@ jobs:
         env:
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "should_release=true" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/cnm/release-v0.1" ]]; then
-            if echo "$COMMIT_MESSAGE" | grep -q '\[no release\]'; then
-              echo "should_release=false" >> $GITHUB_OUTPUT
-            else
-              echo "should_release=true" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "should_release=false" >> $GITHUB_OUTPUT
-          fi
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
 
       - name: Clone
         if: ${{ steps.check.outputs.should_release == 'true' }}
@@ -77,71 +46,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Use MoREL release tag
+      - name: Use MoREL artifact version
         id: tag
-        run: echo "name=cnm-varexp-v0.1" >> "$GITHUB_OUTPUT"
-
-  macos-cpu:
-    needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
-    strategy:
-      matrix:
-        include:
-          - build: 'arm64'
-            arch: 'arm64'
-            os: macos-26
-            defines: "-DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Download UI build
-        uses: actions/download-artifact@v8
-        with:
-          name: llama-ui.zip
-          path: tools/ui/dist
-
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.24
-        with:
-          key: release-${{ matrix.os }}-${{ matrix.arch }}
-          evict-old-files: 1d
-
-      - name: Build
-        id: cmake_build
-        run: |
-          sysctl -a
-          cmake -B build \
-            ${{ matrix.defines }} \
-            -DCMAKE_INSTALL_RPATH='@loader_path' \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DLLAMA_FATAL_WARNINGS=ON \
-            -DLLAMA_BUILD_BORINGSSL=ON \
-            ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
-
-      - name: Pack artifacts
-        id: pack_artifacts
-        run: |
-          cp LICENSE ./build/bin/
-          tar -czvf llama-${{ needs.check-release.outputs.tag_name }}-bin-macos-${{ matrix.build }}.tar.gz -s ",^\.,llama-${{ needs.check-release.outputs.tag_name }}," -C ./build/bin .
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          path: llama-${{ needs.check-release.outputs.tag_name }}-bin-macos-${{ matrix.build }}.tar.gz
-          archive: false
-
-      - name: ccache-clear
-        uses: ./.github/actions/ccache-clear
-        with:
-          key: release-${{ matrix.os }}-${{ matrix.arch }}
+        run: echo "name=cnm-varexp-v0.2" >> "$GITHUB_OUTPUT"
 
   ubuntu-cpu:
     needs: [check-release, ui-build]
@@ -465,6 +372,7 @@ jobs:
       - name: Pack artifacts
         id: pack_artifacts
         run: |
+          Copy-Item LICENSE ./build/bin/Release/
           7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
@@ -478,11 +386,10 @@ jobs:
         with:
           key: release-windows-2025-vs2026-${{ matrix.arch }}-cpu
 
-  # note: builds only the ggml-hip backend - llama-server is injected from the
-  #       windows-cpu zip during the release "Merge artifacts" step
+  # Reuse the CPU package and add the CUDA backend and runtime DLLs.
   windows-cuda:
     name: windows-cuda (${{ matrix.cuda }}, ${{ matrix.arch }})
-    needs: [check-release]
+    needs: [check-release, windows-cpu]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
@@ -530,39 +437,34 @@ jobs:
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
 
-      - name: Pack artifacts
-        id: pack_artifacts
+      - name: Download CPU package
+        uses: actions/download-artifact@v8
+        with:
+          name: llama-bin-win-cpu-${{ matrix.arch }}.zip
+          path: cpu-package
+
+      - name: Pack complete CUDA artifacts
+        shell: pwsh
         run: |
-          7z a -snl llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip .\build\bin\Release\ggml-cuda.dll
+          $ErrorActionPreference = 'Stop'
+          Expand-Archive -LiteralPath cpu-package/llama-bin-win-cpu-${{ matrix.arch }}.zip -DestinationPath package
+          Copy-Item build/bin/Release/ggml-cuda.dll package/
+          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            $dlls = @(Get-ChildItem -Path "$env:CUDA_PATH/bin" -Filter $pattern -File)
+            if ($dlls.Count -eq 0) { throw "Missing CUDA runtime: $pattern" }
+            $dlls | Copy-Item -Destination package/
+          }
+          Copy-Item LICENSE package/
+          foreach ($required in @('llama-server.exe', 'llama-perplexity.exe', 'llama.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cuda.dll', 'cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll')) {
+            if (!(Test-Path "package/$required")) { throw "Incomplete CUDA package: $required" }
+          }
+          7z a -snl llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip ./package/*
+          if ($LASTEXITCODE -ne 0) { throw "7z failed: $LASTEXITCODE" }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           path: llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip
-          archive: false
-
-      - name: Copy and pack Cuda runtime (x64)
-        if: ${{ matrix.arch == 'x64' }}
-        run: |
-          echo "Cuda install location: ${{ env.CUDA_PATH }}"
-          $dst='.\build\bin\cudart\'
-          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip $dst\*
-
-      - name: Copy and pack Cuda runtime (ARM64)
-        if: ${{ matrix.arch == 'arm64' }}
-        run: |
-          echo "Cuda install location: ${{ env.CUDA_PATH }}"
-          $dst='.\build\bin\cudart\'
-          robocopy "${{env.CUDA_PATH}}\bin\arm64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip $dst\*
-
-      - name: Upload Cuda runtime
-        uses: actions/upload-artifact@v7
-        with:
-          path: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip
           archive: false
 
       - name: ccache-clear

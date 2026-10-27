@@ -9,6 +9,7 @@
 #include "llama-model.h"
 #include "llama-vocab.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <unordered_set>
