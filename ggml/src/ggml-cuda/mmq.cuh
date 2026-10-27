@@ -1384,6 +1384,7 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
     int J_best; // Tile width in ne11(dense)/ne12(MoE) direction to use for optimal performance.
+    bool no_split_k = false;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1446,9 +1447,17 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
     const int nwork = ntiles_dst * ((args.ncols_x + config.K_vram - 1) / config.K_vram); // Maximum number of CUDA blocks that can do useful work.
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : std::min(nsm, nwork), 1, 1);
+    // Packed expert banks must keep the complete K sum in one output tile.
+    const dim3 block_nums_stream_k(args.no_split_k || (GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90) ? ntiles_dst : std::min(nsm, nwork), 1, 1);
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+
+    if (args.ids_dst && std::getenv("CNM_TIER_TRACE")) {
+        GGML_LOG_INFO("tiers mmq type=%s experts=%lld tokens=%lld I=%d J=%d sm=%d tiles=%d efficiency=%d blocks=%u fixup=%d no_split_k=%d\n",
+                ggml_type_name(type), (long long) args.nchannels_x, (long long) args.ncols_max,
+                config.I, config.J, nsm, ntiles_dst, tiles_efficiency_percent, block_nums_stream_k.x,
+                int(fixup_needed), int(args.no_split_k));
+    }
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);

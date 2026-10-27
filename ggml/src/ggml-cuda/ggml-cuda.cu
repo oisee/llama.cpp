@@ -5400,7 +5400,7 @@ struct ggml_backend_cuda_device_context {
     int op_offload_min_batch_size;
 };
 
-// Model-independent instruction tables, shared by contexts on the same Turing device.
+// Model-independent instruction tables, shared by contexts on the same device.
 static const float * ggml_backend_cuda_tier_sfu_table(ggml_backend_dev_t dev, bool exponential) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED(dev);
@@ -5408,7 +5408,8 @@ static const float * ggml_backend_cuda_tier_sfu_table(ggml_backend_dev_t dev, bo
     return nullptr;
 #else
     auto * ctx = static_cast<ggml_backend_cuda_device_context *>(dev->context);
-    if (ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_TURING) { return nullptr; }
+    const int cc = ggml_cuda_info().devices[ctx->device].cc;
+    if (cc != GGML_CUDA_CC_TURING && cc != GGML_CUDA_CC_ADA_LOVELACE) { return nullptr; }
     static std::mutex mutex;
     static std::map<std::pair<int, bool>, std::vector<float>> tables;
     std::lock_guard<std::mutex> lock(mutex);
