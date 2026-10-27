@@ -7,6 +7,8 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include "ggml-cpp.h"
+
 #include <map>
 #include <memory>
 #include <string>
@@ -829,6 +831,11 @@ struct llama_model {
     std::vector<int32_t> target_layer_ids;
 
     std::vector<llama_layer> layers;
+
+    // cnm: storage for the per-expert router bias set by CNM_EXPERT_BIAS (layers[il].ffn_gate_inp_b),
+    // one context and buffer per buffer type; buffers are declared after contexts so they are freed first
+    std::vector<ggml_context_ptr>        cnm_bias_ctx;
+    std::vector<ggml_backend_buffer_ptr> cnm_bias_buf;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see

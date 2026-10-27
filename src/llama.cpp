@@ -16,14 +16,23 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include "../vendor/nlohmann/json.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cstdlib>
+#include <fstream>
+#include <map>
+#include <regex>
+#include <set>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -312,6 +321,128 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     return true;
 }
 
+// cnm: per-expert router bias, read from the JSON file named by CNM_EXPERT_BIAS.
+// The bias is added to the router logits before softmax (llama_layer::ffn_gate_inp_b), so a negative value makes an
+// expert less likely to be selected and "-inf" removes it. CNM_EXPERT_BIAS_MODEL restricts the bias to the model whose
+// path contains that string, so a draft model (e.g. the MTP head) loaded in the same process stays unbiased.
+// Format: {"bias": <number|"-inf">, "layers": {"<layer>": [cold expert IDs] | {"<expert>": <number|"-inf">}}}
+static void cnm_apply_expert_bias(llama_model_base & model, const std::string & model_path) {
+    const char * path = std::getenv("CNM_EXPERT_BIAS");
+    if (!path || !*path) { return; }
+    if (const char * target = std::getenv("CNM_EXPERT_BIAS_MODEL")) {
+        if (*target && model_path.find(target) == std::string::npos) {
+            LLAMA_LOG_INFO("CNM_EXPERT_BIAS: '%s' is not the target model, skipping\n", model_path.c_str());
+            return;
+        }
+    }
+    auto fail = [](const std::string & why) { throw std::runtime_error("CNM_EXPERT_BIAS: " + why); };
+    if (model.arch != LLM_ARCH_QWEN4EXP || model.hparams.n_expert_groups > 1) {
+        fail("requires a qwen4exp model with ungrouped softmax routing");
+    }
+    using json = nlohmann::ordered_json;
+    std::ifstream input(path);
+    if (!input) { fail("cannot open JSON: " + std::string(path)); }
+    std::vector<std::set<std::string>> keys;
+    auto callback = [&](int, json::parse_event_t event, json & value) {
+        if (event == json::parse_event_t::object_start) { keys.emplace_back(); }
+        if (event == json::parse_event_t::key && !keys.back().insert(value.get<std::string>()).second) { fail("duplicate key"); }
+        if (event == json::parse_event_t::object_end) { keys.pop_back(); }
+        return true;
+    };
+    json plan;
+    try { plan = json::parse(input, callback); } catch (const json::exception & e) { fail(std::string("invalid JSON: ") + e.what()); }
+    if (!plan.is_object() || !plan.contains("layers") || !plan["layers"].is_object() || plan["layers"].empty()) {
+        fail("expected {bias: number or \"-inf\", layers: {layer: [cold IDs] or {expert: bias}}}");
+    }
+    for (auto it = plan.begin(); it != plan.end(); ++it) {
+        if (it.key() != "bias" && it.key() != "layers") { fail("unknown field: " + it.key()); }
+    }
+    auto parse_bias = [&](const json & v) -> float {
+        if (v.is_string() && v.get<std::string>() == "-inf") { return -INFINITY; }
+        if (!v.is_number()) { fail("bias must be a nonpositive number or \"-inf\""); }
+        const double d = v.get<double>();
+        const float f = static_cast<float>(d);
+        if (!std::isfinite(d) || !std::isfinite(f) || d > 0) { fail("bias must be finite, representable and nonpositive"); }
+        return f;
+    };
+    const float scalar = plan.contains("bias") ? parse_bias(plan["bias"]) : 0.0f;
+    auto parse_id = [&](const std::string & key, size_t limit) -> int {
+        if (!std::regex_match(key, std::regex("0|[1-9][0-9]{0,8}"))) { fail("invalid index: " + key); }
+        const unsigned long long id = std::stoull(key);
+        if (id >= limit) { fail("index out of range: " + key); }
+        return int(id);
+    };
+    const size_t n_expert = model.hparams.n_expert;
+    std::map<int, std::vector<float>> values;
+    for (auto it = plan["layers"].begin(); it != plan["layers"].end(); ++it) {
+        const int il = parse_id(it.key(), model.layers.size());
+        const auto & layer = model.layers[il];
+        if (!layer.ffn_gate_inp || layer.ffn_gate_inp_b || layer.ffn_exp_probs_b || size_t(layer.ffn_gate_inp->ne[1]) != n_expert) {
+            fail("unsupported router in layer " + it.key());
+        }
+        auto & row = values[il];
+        row.assign(n_expert, 0.0f);
+        if (it.value().is_array()) {
+            if (!plan.contains("bias")) { fail("ID arrays require scalar bias"); }
+            std::set<int64_t> seen;
+            for (const auto & e : it.value()) {
+                if (!e.is_number_integer() || e.get<int64_t>() < 0 || e.get<int64_t>() >= int64_t(n_expert)) { fail("invalid expert ID"); }
+                if (!seen.insert(e.get<int64_t>()).second) { fail("duplicate expert ID"); }
+                row[size_t(e.get<int64_t>())] = scalar;
+            }
+        } else if (it.value().is_object()) {
+            for (auto e = it.value().begin(); e != it.value().end(); ++e) { row[parse_id(e.key(), n_expert)] = parse_bias(e.value()); }
+        } else {
+            fail("layer must contain an ID array or expert-value object");
+        }
+        if (size_t(std::count_if(row.begin(), row.end(), [](float f) { return std::isfinite(f); })) < model.hparams.n_expert_used(il)) {
+            fail("fewer than top_k finite experts in layer " + it.key());
+        }
+    }
+    size_t n = 0;
+    for (const auto & row : values) {
+        if (std::any_of(row.second.begin(), row.second.end(), [](float f) { return f != 0; })) { ++n; }
+    }
+    // Keep each bias in the buffer type of its router weight (VRAM when the router is on the GPU), so the add stays
+    // on the router's device; a host buffer type gets the plain CPU type (not e.g. a repack type).
+    std::map<ggml_backend_buffer_type_t, std::vector<int>> by_buft;
+    for (const auto & row : values) {
+        if (std::none_of(row.second.begin(), row.second.end(), [](float f) { return f != 0; })) { continue; }
+        const ggml_tensor * w = model.layers[row.first].ffn_gate_inp;
+        ggml_backend_buffer_type_t buft = w->buffer ? ggml_backend_buffer_get_type(w->buffer) : nullptr;
+        if (!buft || ggml_backend_buft_is_host(buft)) { buft = ggml_backend_cpu_buffer_type(); }
+        by_buft[buft].push_back(row.first);
+    }
+    for (const auto & [buft, layers] : by_buft) {
+        ggml_context_ptr ctx(ggml_init({layers.size() * ggml_tensor_overhead(), nullptr, true}));
+        if (!ctx) { fail("cannot allocate context"); }
+        std::map<int, ggml_tensor *> tensors;
+        for (int il : layers) {
+            ggml_tensor * t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, int64_t(n_expert));
+            ggml_format_name(t, "cnm_expert_bias-%d", il);
+            tensors[il] = t;
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        if (!buf) { fail(std::string("cannot allocate buffer on ") + ggml_backend_buft_name(buft)); }
+        ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (const auto & [il, t] : tensors) {
+            const auto & data = values.at(il);
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            model.layers[il].ffn_gate_inp_b = t;
+        }
+        model.cnm_bias_ctx.push_back(std::move(ctx));
+        model.cnm_bias_buf.push_back(std::move(buf));
+    }
+    const std::string encoded = plan.dump();
+    uint64_t h = 1469598103934665603ULL; // FNV-1a of the canonical plan, to tell bias files apart in logs
+    for (unsigned char c : encoded) { h = (h ^ c) * 1099511628211ULL; }
+    LLAMA_LOG_INFO("CNM_EXPERT_BIAS: %zu layers, %zu nonzero vectors, plan fnv1a64 %016llx, file %s\n", values.size(), n,
+                   (unsigned long long) h, path);
+    for (const auto & [buft, layers] : by_buft) {
+        LLAMA_LOG_INFO("CNM_EXPERT_BIAS: %zu bias vectors in %s\n", layers.size(), ggml_backend_buft_name(buft));
+    }
+}
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
@@ -369,6 +500,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+
+        cnm_apply_expert_bias(*model, fname);
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
