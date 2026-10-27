@@ -2409,13 +2409,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const size_t workspace = size_t(256) * (8 * max_ff + 3 * n_embd) * sizeof(float) + 96 * 4096;
             res->tier_runtime = llama_tier_runtime_create(workspace, std::max(size_t(256 * n_embd * sizeof(float)), size_t(n_tokens * n_expert_used * sizeof(int32_t))));
         }
+        auto * device = ggml_backend_buffer_is_host(gate_inp->buffer) ? nullptr : ggml_backend_buft_get_device(ggml_backend_buffer_get_type(gate_inp->buffer));
         auto dispatch = llama_tier_dispatch_create(*tier_layer, hparams.swiglu_clamp_exp[il], arch == LLM_ARCH_GLM5_NEXT,
-                n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads, res->tier_runtime);
+                n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads, device, res->tier_runtime);
         auto * tier_input = ggml_cont(ctx0, cur);
         cb(tier_input, "ffn_moe_tier_input", il);
         experts = llama_tier_dispatch_build(*dispatch, ctx0, tier_input, ggml_cont(ctx0, selected_experts));
         res->tier_dispatches.push_back(std::move(dispatch));
-        auto * device = ggml_backend_buffer_is_host(gate_inp->buffer) ? nullptr : ggml_backend_buft_get_device(ggml_backend_buffer_get_type(gate_inp->buffer));
         ggml_backend_t layer_backend = backend_cpu;
         for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
             auto * candidate = ggml_backend_sched_get_backend(sched, b);

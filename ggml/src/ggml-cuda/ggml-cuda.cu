@@ -5400,6 +5400,22 @@ struct ggml_backend_cuda_device_context {
     int op_offload_min_batch_size;
 };
 
+// 0: unsupported, 1: MMVQ Q8_1 with half scales, 2: MMQ D4 with float scales.
+static int ggml_backend_cuda_tier_quant_policy(ggml_backend_dev_t dev, ggml_type type, int64_t tokens, int64_t experts) {
+    auto * ctx = static_cast<ggml_backend_cuda_device_context *>(dev->context);
+    const int previous = ggml_cuda_get_device();
+    ggml_cuda_set_device(ctx->device);
+    const int cc = ggml_cuda_info().devices[ctx->device].cc;
+    int policy = 0;
+    if (tokens <= MMVQ_MAX_BATCH_SIZE && tokens <= get_mmvq_mmid_max_batch(type, cc)) {
+        policy = 1;
+    } else if (ggml_cuda_should_use_mmq(type, cc, tokens, experts)) {
+        policy = 2;
+    }
+    ggml_cuda_set_device(previous);
+    return policy;
+}
+
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ctx->name.c_str();
@@ -6209,6 +6225,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_tier_quant_policy") == 0) {
+        return (void *)ggml_backend_cuda_tier_quant_policy;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

@@ -5,13 +5,17 @@
 #include "llama-impl.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <string>
 #include <cstring>
+#include <cstdint>
 #include <limits>
 #include <chrono>
 #include <map>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <vector>
 
@@ -71,6 +75,7 @@ struct llama_tier_runtime {
 
 namespace {
 constexpr int64_t pair_tile = 256;
+
 struct bank_graph {
     ggml_context * ctx = nullptr;
     ggml_backend_t backend = nullptr;
@@ -79,7 +84,12 @@ struct bank_graph {
     ggml_tensor * ids = nullptr;
     ggml_tensor * input = nullptr;
     ggml_tensor * output = nullptr;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * up = nullptr;
+    ggml_tensor * activated = nullptr;
+    std::array<int, 3> quant_policy{};
     int64_t pairs = 0;
+    int64_t logical_tokens = 0;
     const ggml_tensor * source = nullptr;
     const void * source_data = nullptr;
     ggml_backend_buffer_t source_buffer = nullptr;
@@ -95,7 +105,11 @@ struct llama_tier_dispatch {
     float clamp;
     bool glm;
     int threads;
+    ggml_backend_dev_t layer_device;
     bool instrument;
+    bool cuda_arithmetic;
+    std::string dump_directory;
+    uint64_t dump_sequence = 0;
     ggml_backend_sched_dispatch boundary;
     std::shared_ptr<llama_tier_runtime> runtime;
     std::map<int64_t, std::unique_ptr<bank_graph>> hot, cold;
@@ -103,8 +117,10 @@ struct llama_tier_dispatch {
     uint64_t hot_pairs = 0, cold_pairs = 0, cold_input_bytes = 0, cold_output_bytes = 0;
     uint64_t hot_jobs = 0, cold_jobs = 0, cold_skips = 0;
     double body_ms = 0, control_ms = 0;
+    std::vector<uint8_t> scatter_coverage;
 
-    llama_tier_dispatch(const llama_expert_tiers & layer, float clamp, bool glm, int threads, std::shared_ptr<llama_tier_runtime> runtime) : layer(layer), clamp(clamp), glm(glm), threads(threads), instrument(std::getenv("CNM_TIER_TRACE") != nullptr), runtime(std::move(runtime)) {
+    llama_tier_dispatch(const llama_expert_tiers & layer, float clamp, bool glm, int threads, ggml_backend_dev_t layer_device, std::shared_ptr<llama_tier_runtime> runtime) : layer(layer), clamp(clamp), glm(glm), threads(threads), layer_device(layer_device), instrument(std::getenv("CNM_TIER_TRACE") != nullptr), cuda_arithmetic(std::getenv("CNM_TIER_CUDA_ARITH") != nullptr), runtime(std::move(runtime)) {
+        if (const char * path = std::getenv("CNM_TIER_DUMP")) { dump_directory = path; }
         boundary = {execute, this};
         int32_t count = 0;
         for (const auto * bank : {&layer.hot, &layer.cold}) {
@@ -113,6 +129,26 @@ struct llama_tier_dispatch {
         source_map.assign(count, std::numeric_limits<int32_t>::min());
         for (size_t i = 0; i < layer.hot.ids.size(); ++i) { source_map[layer.hot.ids[i]] = int32_t(i); }
         for (size_t i = 0; i < layer.cold.ids.size(); ++i) { source_map[layer.cold.ids[i]] = -int32_t(i) - 1; }
+    }
+
+    ggml_tensor * projection(bank_graph & graph, ggml_tensor * weight, ggml_tensor * input, int index, bool cpu) {
+        const bool supported = weight->type == GGML_TYPE_IQ3_S || weight->type == GGML_TYPE_IQ3_XXS ||
+            weight->type == GGML_TYPE_IQ4_XS || weight->type == GGML_TYPE_IQ4_NL;
+        if (cpu && layer_device && cuda_arithmetic && ggml_is_quantized(weight->type) && !supported) {
+            throw std::runtime_error("expert tiers: unsupported CPU/CUDA compatibility weight type");
+        }
+        if (cpu && layer_device && supported && cuda_arithmetic) {
+            using query_t = int (*)(ggml_backend_dev_t, ggml_type, int64_t, int64_t);
+            auto query = reinterpret_cast<query_t>(ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(layer_device), "ggml_backend_cuda_tier_quant_policy"));
+            if (!query) { throw std::runtime_error("expert tiers: CUDA arithmetic policy unavailable"); }
+            graph.quant_policy[index] = query(layer_device, weight->type, graph.source->ne[1], layer.hot.ids.size() + layer.cold.ids.size());
+            if (!graph.quant_policy[index]) { throw std::runtime_error("expert tiers: unsupported CUDA arithmetic policy"); }
+            ggml_tensor * args[] = {weight, input, graph.ids};
+            return ggml_custom_4d(graph.ctx, GGML_TYPE_F32, weight->ne[1], 1, graph.pairs, 1,
+                    args, 3, ggml_cpu_tier_quant_matmul, GGML_N_TASKS_MAX, &graph.quant_policy[index]);
+        }
+        return ggml_mul_mat_id(graph.ctx, weight, input, graph.ids);
     }
 
     std::unique_ptr<bank_graph> prepare(const llama_expert_bank & bank, ggml_tensor * activations, int64_t n) {
@@ -127,6 +163,9 @@ struct llama_tier_dispatch {
         if (!cpu && std::string(ggml_backend_dev_name(dev)).find("CUDA") != 0) {
             throw std::runtime_error("expert tiers: non-CUDA GPU bank is unsupported");
         }
+        if (!cpu && !dump_directory.empty() && !std::getenv("GGML_CUDA_DISABLE_FUSION")) {
+            throw std::runtime_error("expert tiers: CUDA projection dumps require GGML_CUDA_DISABLE_FUSION=1");
+        }
         for (auto * weight : {bank.down, bank.up, bank.gate, bank.gate_up}) {
             auto * weight_dev = weight ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(weight->buffer)) : nullptr;
             if (weight && ggml_backend_buffer_is_host(weight->buffer)) { weight_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU); }
@@ -140,6 +179,7 @@ struct llama_tier_dispatch {
         if (!g->ctx) { throw std::bad_alloc(); }
         auto * ctx = g->ctx;
         g->pairs = n;
+        g->logical_tokens = activations->ne[1];
         g->source = activations;
         g->source_data = activations->data;
         g->source_buffer = activations->buffer;
@@ -162,20 +202,21 @@ struct llama_tier_dispatch {
         }
         ggml_tensor * gate, * up;
         if (bank.gate_up) {
-            auto * merged = ggml_mul_mat_id(ctx, bank.gate_up, input, g->ids);
+            auto * merged = projection(*g, bank.gate_up, input, 0, cpu);
             int64_t ff = merged->ne[0] / 2;
             gate = ggml_view_3d(ctx, merged, ff, 1, n, merged->nb[1], merged->nb[2], 0);
             up = ggml_view_3d(ctx, merged, ff, 1, n, merged->nb[1], merged->nb[2], ff * merged->nb[0]);
         } else {
-            up = ggml_mul_mat_id(ctx, bank.up, input, g->ids);
-            gate = ggml_mul_mat_id(ctx, bank.gate, input, g->ids);
+            up = projection(*g, bank.up, input, 1, cpu);
+            gate = projection(*g, bank.gate, input, 0, cpu);
         }
         ggml_tensor * activated;
         if (bank.gate && clamp > 1e-6f) {
             activated = glm ? ggml_swiglu_clamp(ctx, gate, up, clamp) :
                 ggml_mul(ctx, ggml_clamp(ctx, ggml_silu(ctx, gate), -INFINITY, clamp), ggml_clamp(ctx, up, -clamp, clamp));
         } else { activated = ggml_swiglu_split(ctx, gate, up); }
-        g->output = ggml_mul_mat_id(ctx, bank.down, activated, g->ids);
+        g->gate = gate; g->up = up; g->activated = activated;
+        g->output = projection(*g, bank.down, activated, 2, cpu);
         ggml_set_output(g->output);
         g->graph = ggml_new_graph_custom(ctx, 128, false);
         ggml_build_forward_expand(g->graph, g->output);
@@ -199,13 +240,58 @@ struct llama_tier_dispatch {
         return g;
     }
 
-    void run_bank(const llama_expert_bank & bank, std::map<int64_t, std::unique_ptr<bank_graph>> & variants, const std::vector<int64_t> & pairs,
-            const std::vector<int32_t> & local, ggml_tensor * dst) {
-        if (pairs.empty()) { return; }
+    void dump_bank(const llama_expert_bank & bank, const bank_graph & g, const std::vector<int64_t> & pairs,
+            const std::vector<int32_t> & local, size_t begin, int64_t k) {
+        if (dump_directory.empty()) { return; }
+        std::filesystem::create_directories(dump_directory);
+        const std::string prefix = dump_directory + "/" + bank.down->name + ".t" + std::to_string(g.logical_tokens) + ".d" + std::to_string(reinterpret_cast<std::uintptr_t>(this)) + "." + std::to_string(dump_sequence++);
+        std::ofstream mapping(prefix + ".pairs");
+        for (int64_t i = 0; i < g.pairs; ++i) {
+            const auto q = pairs[begin + i];
+            mapping << q << " " << q / k << " " << q % k << " " << bank.ids.at(local[begin + i]) << " " << local[begin + i] << "\n";
+        }
+        std::ofstream policy(prefix + ".policy");
+        policy << ggml_backend_name(g.backend) << " logical_tokens=" << g.logical_tokens << " packed_pairs=" << g.pairs << "\n";
+        policy << "quant_policy=" << g.quant_policy[0] << "," << g.quant_policy[1] << "," << g.quant_policy[2] << "\n";
+        for (auto * weight : {bank.gate, bank.up, bank.gate_up, bank.down}) {
+            if (weight) { policy << weight->name << " " << ggml_type_name(weight->type) << " " << weight->data << " " << weight->nb[2] << "\n"; }
+        }
+        for (const auto & item : std::vector<std::pair<const char *, ggml_tensor *>>{{"gate", g.gate}, {"up", g.up}, {"activated", g.activated}, {"down", g.output}}) {
+            std::string path = prefix + "." + item.first;
+            auto * tensor = item.second;
+            std::ofstream shape(path + ".shape");
+            shape << int(tensor->type);
+            for (int i = 0; i < 4; ++i) { shape << " " << tensor->ne[i]; }
+            for (int i = 0; i < 4; ++i) { shape << " " << tensor->nb[i]; }
+            shape << "\n";
+            std::vector<char> data(ggml_nbytes(tensor));
+            ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
+            std::ofstream binary(path + ".bin", std::ios::binary);
+            binary.write(data.data(), data.size());
+            if (!shape || !binary || !mapping || !policy) { throw std::runtime_error("expert tiers: diagnostic write failed"); }
+        }
+    }
+
+    void run_bank(const llama_expert_bank & bank, std::map<int64_t, std::unique_ptr<bank_graph>> & variants, const std::vector<int64_t> & original_pairs,
+            const std::vector<int32_t> & original_local, ggml_tensor * dst) {
+        if (original_pairs.empty()) { return; }
         auto * src = dst->src[0];
         const int64_t d = dst->ne[0], k = dst->ne[1];
         const size_t bytes = d * sizeof(float);
         const bool cpu = ggml_backend_buffer_is_host(bank.down->buffer);
+        const bool group_cpu = cpu && !std::getenv("CNM_TIER_LEGACY_CPU_TILES");
+        std::vector<int64_t> sorted_pairs;
+        std::vector<int32_t> sorted_local;
+        if (group_cpu) {
+            sorted_pairs.resize(original_pairs.size()); sorted_local.resize(original_local.size());
+            std::vector<size_t> order(original_pairs.size());
+            for (size_t i = 0; i < order.size(); ++i) { order[i] = i; }
+            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return original_local[a] < original_local[b]; });
+            for (size_t i = 0; i < order.size(); ++i) { sorted_pairs[i] = original_pairs[order[i]]; sorted_local[i] = original_local[order[i]]; }
+        }
+        const auto & pairs = group_cpu ? sorted_pairs : original_pairs;
+        const auto & local = group_cpu ? sorted_local : original_local;
+        // Group each expert and balance large groups so no tail switches from tiled dots to vec_dot.
         // Read each needed token once per bank invocation, including across tiles.
         std::map<int64_t, std::vector<float>> inputs;
         if (cpu) {
@@ -221,14 +307,24 @@ struct llama_tier_dispatch {
                 }
             }
         }
-        const int64_t tile = std::min(pair_tile, src->ne[1]);
-        for (size_t begin = 0; begin < pairs.size(); begin += tile) {
-            const int64_t n = std::min<size_t>(tile, pairs.size() - begin);
+        const int64_t tile = group_cpu ? pair_tile : std::min(pair_tile, src->ne[1]);
+        size_t group_end = 0;
+        for (size_t begin = 0; begin < pairs.size();) {
+            int64_t n = std::min<size_t>(tile, pairs.size() - begin);
+            if (group_cpu) {
+                if (begin == group_end) {
+                    group_end = begin + 1;
+                    while (group_end < pairs.size() && local[group_end] == local[begin]) { ++group_end; }
+                }
+                const int64_t remaining = group_end - begin;
+                const int64_t tiles = (remaining + pair_tile - 1) / pair_tile;
+                n = (remaining + tiles - 1) / tiles;
+            }
             // Bound metadata variants; decode keeps every possible nonempty pair count.
             const size_t max_variants = k <= 16 && dst->ne[2] == 1 ? size_t(k) : 4;
             if (!variants.count(n) && variants.size() >= max_variants) { variants.erase(variants.begin()); }
             auto & cached = variants[n];
-            if (!cached || cached->source != src || cached->source_data != src->data || cached->source_buffer != src->buffer) {
+            if (!cached || cached->source != src || cached->source_data != src->data || cached->source_buffer != src->buffer || cached->logical_tokens != src->ne[1]) {
                 cached = prepare(bank, src, n);
             }
             auto & g = *cached;
@@ -244,12 +340,16 @@ struct llama_tier_dispatch {
             else { ggml_backend_tensor_set(g.tokens, tokens.data(), 0, tokens.size() * sizeof(int32_t)); }
             const auto started = instrument ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (ggml_backend_graph_compute(g.backend, g.graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("expert tiers: bank execution failed"); }
+            dump_bank(bank, g, pairs, local, begin, k);
             if (instrument) { body_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(); }
             if (&bank == &layer.cold) { ++cold_jobs; } else { ++hot_jobs; }
             // Copy disjoint slot vectors without tier reduction or cancellation.
             auto * view_ctx = ggml_init({ggml_tensor_overhead() * 2 * n, nullptr, true});
             if (!view_ctx) { throw std::bad_alloc(); }
             for (int64_t i = 0; i < n; ++i) {
+                if (!scatter_coverage.empty() && scatter_coverage.at(pairs[begin + i])++) {
+                    throw std::runtime_error("expert tiers: duplicate output slot");
+                }
                 auto * from = ggml_view_1d(view_ctx, g.output, d, i * g.output->nb[2]);
                 auto * to = ggml_view_1d(view_ctx, dst, d, pairs[begin + i] * bytes);
                 ggml_backend_view_init(from);
@@ -262,6 +362,7 @@ struct llama_tier_dispatch {
                 } else { ggml_backend_tensor_copy(from, to); }
             }
             ggml_free(view_ctx);
+            begin += n;
         }
     }
 
@@ -291,8 +392,12 @@ struct llama_tier_dispatch {
             }
             if (self.instrument) { self.control_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(); }
             if (cold.empty()) { ++self.cold_skips; }
+            if (self.instrument || !self.dump_directory.empty()) { self.scatter_coverage.assign(k * t, 0); }
             self.run_bank(self.layer.hot, self.hot, hot, hot_ids, dst);
             self.run_bank(self.layer.cold, self.cold, cold, cold_ids, dst);
+            if (!self.scatter_coverage.empty() && std::find(self.scatter_coverage.begin(), self.scatter_coverage.end(), uint8_t(0)) != self.scatter_coverage.end()) {
+                throw std::runtime_error("expert tiers: missing output slot");
+            }
             self.hot_pairs += hot.size(); self.cold_pairs += cold.size();
             if (self.instrument) {
                 LLAMA_LOG_INFO("tiers hot=%zu cold=%zu cold_input_bytes=%llu cold_output_bytes=%llu\n", hot.size(), cold.size(),
@@ -312,8 +417,8 @@ std::shared_ptr<llama_tier_runtime> llama_tier_runtime_create(size_t bytes, size
     return std::make_shared<llama_tier_runtime>(bytes, staging_bytes);
 }
 
-std::shared_ptr<llama_tier_dispatch> llama_tier_dispatch_create(const llama_expert_tiers & layer, float clamp, bool glm, int threads, std::shared_ptr<llama_tier_runtime> runtime) {
-    return std::make_shared<llama_tier_dispatch>(layer, clamp, glm, threads, std::move(runtime));
+std::shared_ptr<llama_tier_dispatch> llama_tier_dispatch_create(const llama_expert_tiers & layer, float clamp, bool glm, int threads, ggml_backend_dev_t layer_device, std::shared_ptr<llama_tier_runtime> runtime) {
+    return std::make_shared<llama_tier_dispatch>(layer, clamp, glm, threads, layer_device, std::move(runtime));
 }
 
 ggml_tensor * llama_tier_dispatch_build(llama_tier_dispatch & dispatch, ggml_context * ctx, ggml_tensor * input, ggml_tensor * ids) {

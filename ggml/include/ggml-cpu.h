@@ -24,6 +24,9 @@ extern "C" {
         bool use_ref;
     };
 
+    // Experimental tier-only custom op. userdata points to 1 (MMVQ) or 2 (MMQ D4).
+    GGML_BACKEND_API void ggml_cpu_tier_quant_matmul(struct ggml_tensor * dst, int ith, int nth, void * userdata);
+
     // numa strategies
     enum ggml_numa_strategy {
         GGML_NUMA_STRATEGY_DISABLED   = 0,

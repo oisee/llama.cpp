@@ -5,6 +5,11 @@
 #include "traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
+#include "ggml-quants.h"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
 
 #include <cctype>
 #include <string>
@@ -36,6 +41,97 @@
 #    include <sys/sysctl.h>
 #    include <sys/types.h>
 #endif
+
+// Portable tier-only integer dots with the CUDA activation representation.
+void ggml_cpu_tier_quant_matmul(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const int policy = *static_cast<const int *>(userdata);
+    GGML_ASSERT(policy == 1 || policy == 2);
+    const auto * weight = dst->src[0];
+    GGML_ASSERT(weight->type == GGML_TYPE_IQ3_S || weight->type == GGML_TYPE_IQ3_XXS ||
+                weight->type == GGML_TYPE_IQ4_XS || weight->type == GGML_TYPE_IQ4_NL);
+    const auto * input = dst->src[1];
+    const auto * ids = dst->src[2];
+    const auto * traits = ggml_get_type_traits(weight->type);
+    const int64_t width = weight->ne[0], rows = weight->ne[1], block = traits->blck_size;
+    GGML_ASSERT(width % 32 == 0 && width % block == 0 && block <= 256);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && input->ne[0] == width && input->ne[1] == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[0] == 1 && ids->ne[1] == input->ne[2]);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[0] == rows && dst->ne[1] == 1 && dst->ne[2] == input->ne[2]);
+    std::vector<int8_t> codes(width);
+    std::vector<float> scales(width / 32);
+    std::array<float, 256> decoded;
+    for (int64_t pair = 0; pair < input->ne[2]; ++pair) {
+        const auto * x = reinterpret_cast<const float *>(static_cast<const char *>(input->data) + pair * input->nb[2]);
+        int32_t expert;
+        std::memcpy(&expert, static_cast<const char *>(ids->data) + pair * ids->nb[1], sizeof(expert));
+        GGML_ASSERT(expert >= 0 && expert < weight->ne[2]);
+        for (int64_t c = 0; c < width; c += 32) {
+            float amax = 0;
+            for (int i = 0; i < 32; ++i) { amax = std::max(amax, std::abs(x[c + i])); }
+            const float d = amax / 127.0f;
+            const float inverse = amax ? 127.0f / amax : 0;
+            scales[c / 32] = policy == 1 ? ggml_fp16_to_fp32(ggml_fp32_to_fp16(d)) : (amax ? 1.0f / inverse : 0);
+            for (int i = 0; i < 32; ++i) {
+                codes[c + i] = amax ? int8_t(std::round(policy == 1 ? x[c + i] / d : x[c + i] * inverse)) : 0;
+            }
+        }
+        auto * out = reinterpret_cast<float *>(static_cast<char *>(dst->data) + pair * dst->nb[2]);
+        for (int64_t row = ith; row < rows; row += nth) {
+            const auto * raw = static_cast<const char *>(weight->data) + expert * weight->nb[2] + row * weight->nb[1];
+            float sum = 0;
+            std::array<float, 32> partial{};
+            for (int64_t c = 0; c < width; c += block) {
+                const auto * packed = raw + (c / block) * traits->type_size;
+                ggml_fp16_t half;
+                std::memcpy(&half, packed, sizeof(half));
+                float d = ggml_fp16_to_fp32(half);
+                if (weight->type == GGML_TYPE_IQ3_XXS) { d *= 0.25f; }
+                traits->to_float(packed, decoded.data(), block);
+                if (d == 0) { continue; }
+                for (int64_t group = 0; group < block; group += 32) {
+                    const int g = group / 32;
+                    float subscale = d;
+                    int multiplier = 1;
+                    if (weight->type == GGML_TYPE_IQ3_S) {
+                        const auto * b = reinterpret_cast<const block_iq3_s *>(packed);
+                        multiplier = 1 + 2 * ((b->scales[g / 2] >> (4 * (g % 2))) & 15);
+                    } else if (weight->type == GGML_TYPE_IQ4_XS) {
+                        const auto * b = reinterpret_cast<const block_iq4_xs *>(packed);
+                        multiplier = ((b->scales_l[g / 2] >> (4 * (g % 2))) & 15) | (((b->scales_h >> (2 * g)) & 3) << 4);
+                        multiplier -= 32;
+                    } else if (weight->type == GGML_TYPE_IQ3_XXS) {
+                        const auto * b = reinterpret_cast<const block_iq3_xxs *>(packed);
+                        uint32_t scale_signs;
+                        std::memcpy(&scale_signs, b->qs + QK_K / 4 + 4 * g, sizeof(scale_signs));
+                        multiplier = 1 + 2 * (scale_signs >> 28);
+                    }
+                    subscale *= multiplier;
+                    if (subscale == 0) { continue; }
+                    int dots[2] = {};
+                    for (int i = 0; i < 32; ++i) {
+                        dots[(i % 16) / 8] += int(std::round(decoded[group + i] / subscale)) * codes[c + group + i];
+                    }
+                    const float activation_scale = scales[(c + group) / 32];
+                    if (policy == 2) {
+                        sum = std::fma(float(dots[0] + dots[1]) * subscale, activation_scale, sum);
+                    } else if (weight->type == GGML_TYPE_IQ4_NL) {
+                        for (int i = 0; i < 2; ++i) { partial[((c + group) / 16 + i) % 32] += (d * activation_scale) * dots[i]; }
+                    } else {
+                        partial[((c + group) / 32) % 32] += (d * activation_scale) * ((dots[0] + dots[1]) * multiplier);
+                    }
+                }
+            }
+            if (policy == 1) {
+                for (int offset = 16; offset; offset /= 2) {
+                    auto previous = partial;
+                    for (int i = 0; i < 32; ++i) { partial[i] = previous[i] + previous[i ^ offset]; }
+                }
+                sum = partial[0];
+            }
+            out[row] = sum;
+        }
+    }
+}
 
 // ggml-backend interface
 
