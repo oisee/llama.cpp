@@ -93,6 +93,8 @@ struct bank_graph {
     ggml_cpu_tier_swiglu_params swiglu{};
     int64_t pairs = 0;
     int64_t logical_tokens = 0;
+    size_t pair_stride = 0; // bytes between packed slot vectors in output
+    bool decode = false;    // one-token CUDA form: src1 [d,1,1], ids [n,1]
     const ggml_tensor * source = nullptr;
     const void * source_data = nullptr;
     ggml_backend_buffer_t source_buffer = nullptr;
@@ -211,7 +213,10 @@ struct llama_tier_dispatch {
         g->source = activations;
         g->source_data = activations->data;
         g->source_buffer = activations->buffer;
-        g->ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n);
+        // One-token GPU bank: shape it like the flat MoE decode (src1 [d,1,1], ids [n,1]) so that
+        // ne2 = 1 and CUDA mul_mat_id takes MMVQ with ids, not MMQ over n packed pairs.
+        g->decode = !cpu && activations->ne[1] == 1;
+        g->ids = g->decode ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n, 1) : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n);
         ggml_set_input(g->ids);
         ggml_tensor * input;
         // GPU gathers stay on the layer device. CPU inputs contain selected pairs only.
@@ -219,6 +224,11 @@ struct llama_tier_dispatch {
             g->input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, activations->ne[0], 1, n);
             ggml_set_input(g->input);
             input = g->input;
+        } else if (g->decode) {
+            auto * external = ggml_dup_tensor(ctx, activations);
+            external->data = activations->data;
+            external->buffer = activations->buffer;
+            input = ggml_reshape_3d(ctx, external, activations->ne[0], 1, 1);
         } else {
             g->tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
             ggml_set_input(g->tokens);
@@ -232,8 +242,8 @@ struct llama_tier_dispatch {
         if (bank.gate_up) {
             auto * merged = projection(*g, bank.gate_up, input, 0, cpu);
             int64_t ff = merged->ne[0] / 2;
-            gate = ggml_view_3d(ctx, merged, ff, 1, n, merged->nb[1], merged->nb[2], 0);
-            up = ggml_view_3d(ctx, merged, ff, 1, n, merged->nb[1], merged->nb[2], ff * merged->nb[0]);
+            gate = ggml_view_3d(ctx, merged, ff, merged->ne[1], merged->ne[2], merged->nb[1], merged->nb[2], 0);
+            up = ggml_view_3d(ctx, merged, ff, merged->ne[1], merged->ne[2], merged->nb[1], merged->nb[2], ff * merged->nb[0]);
         } else {
             up = projection(*g, bank.up, input, 1, cpu);
             gate = projection(*g, bank.gate, input, 0, cpu);
@@ -252,6 +262,7 @@ struct llama_tier_dispatch {
         g->gate = gate; g->up = up; g->activated = activated;
         g->output = projection(*g, bank.down, activated, 2, cpu);
         ggml_set_output(g->output);
+        g->pair_stride = g->decode ? g->output->nb[1] : g->output->nb[2];
         g->graph = ggml_new_graph_custom(ctx, 128, false);
         ggml_build_forward_expand(g->graph, g->output);
         for (int i = 0; i < ggml_graph_n_nodes(g->graph); ++i) {
@@ -371,7 +382,7 @@ struct llama_tier_dispatch {
             }
             ggml_backend_tensor_set(g.ids, ids.data(), 0, ids.size() * sizeof(int32_t));
             if (cpu) { ggml_backend_tensor_set(g.input, packed.data(), 0, packed.size() * sizeof(float)); }
-            else { ggml_backend_tensor_set(g.tokens, tokens.data(), 0, tokens.size() * sizeof(int32_t)); }
+            else if (g.tokens) { ggml_backend_tensor_set(g.tokens, tokens.data(), 0, tokens.size() * sizeof(int32_t)); }
             const auto started = instrument ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (ggml_backend_graph_compute(g.backend, g.graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("expert tiers: bank execution failed"); }
             dump_bank(bank, g, pairs, local, begin, k);
@@ -384,7 +395,7 @@ struct llama_tier_dispatch {
                 if (!scatter_coverage.empty() && scatter_coverage.at(pairs[begin + i])++) {
                     throw std::runtime_error("expert tiers: duplicate output slot");
                 }
-                auto * from = ggml_view_1d(view_ctx, g.output, d, i * g.output->nb[2]);
+                auto * from = ggml_view_1d(view_ctx, g.output, d, i * g.pair_stride);
                 auto * to = ggml_view_1d(view_ctx, dst, d, pairs[begin + i] * bytes);
                 ggml_backend_view_init(from);
                 ggml_backend_view_init(to);
