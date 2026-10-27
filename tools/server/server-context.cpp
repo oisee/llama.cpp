@@ -1951,12 +1951,12 @@ private:
                         SLT_WRN(slot, "cnm: switching the bias to '%s' while slot %d is processing\n", task.params.cnm_bias_profile.c_str(), other.id);
                     }
                 }
+                if (task.params.cnm_prefetch) {
+                    cnm_check_prefetch(task.params.cnm_bias_profile);
+                }
                 cnm_set_bias(task.params.cnm_bias_profile, task.params.cnm_bias);
                 if (task.params.cnm_prefetch) {
-                    const auto it = cnm_profiles.find(task.params.cnm_bias_profile);
-                    if (it != cnm_profiles.end() && !it->second.prefetch.empty()) {
-                        cnm_prefetch(it->second.prefetch);
-                    }
+                    cnm_prefetch(cnm_profiles.at(task.params.cnm_bias_profile).prefetch);
                 }
             } catch (const std::exception & e) {
                 send_error(task, std::string("cnm: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3037,6 +3037,9 @@ private:
 
     bool cnm_load_profiles(const std::string & dir) {
         namespace fs = std::filesystem;
+        if (!llama_model_cnm_bias_runtime(model_tgt)) {
+            SRV_WRN("cnm: %s\n", "the model was loaded without CNM_EXPERT_BIAS_RUNTIME=1: bias profiles cannot be switched (prefetch and stats work)");
+        }
         try {
             for (const auto & entry : fs::directory_iterator(dir)) {
                 const std::string file = entry.path().filename().string();
@@ -3149,6 +3152,28 @@ private:
         return res;
     }
 
+    static float cnm_parse_bias_value(const json & req, const char * key) {
+        if (!req.contains(key) || req.at(key).is_null()) {
+            return NAN;
+        }
+        const double d = req.at(key).get<double>();
+        if (!std::isfinite(d) || d > 0 || d < -1e30) {
+            throw std::invalid_argument(std::string(key) + " must be a finite number <= 0");
+        }
+        return (float) d;
+    }
+
+    void cnm_check_prefetch(const std::string & name) const {
+        const auto it = cnm_profiles.find(name);
+        if (it == cnm_profiles.end() || it->second.prefetch.empty()) {
+            throw std::invalid_argument("profile has no prefetch list: " + name);
+        }
+        llama_moe_cache_stats c = {};
+        if (llama_moe_cache_get_stats(ctx_tgt, &c) != 0) {
+            throw std::runtime_error("the context has no MoE cache (--moe-cache-mib)");
+        }
+    }
+
     // op "bias": {profile, bias?, prefetch?}; op "prefetch": {profile} or {layers} or {pairs}; op "stats"
     json cnm_handle(const json & req) {
         const std::string op = json_value(req, "op", std::string());
@@ -3157,14 +3182,14 @@ private:
         }
         if (op == "bias") {
             const std::string name = json_value(req, "profile", std::string());
-            const float bias = req.contains("bias") && !req.at("bias").is_null() ? req.at("bias").get<float>() : NAN;
+            const float bias = cnm_parse_bias_value(req, "bias");
+            const bool prefetch = json_value(req, "prefetch", false);
+            if (prefetch) {
+                cnm_check_prefetch(name); // before switching: a failed request leaves the bias unchanged
+            }
             json res = cnm_set_bias(name, bias);
-            if (json_value(req, "prefetch", false)) {
-                const auto it = cnm_profiles.find(name);
-                if (it == cnm_profiles.end() || it->second.prefetch.empty()) {
-                    throw std::invalid_argument("profile has no prefetch list: " + name);
-                }
-                res["prefetch"] = cnm_prefetch(it->second.prefetch);
+            if (prefetch) {
+                res["prefetch"] = cnm_prefetch(cnm_profiles.at(name).prefetch);
             }
             return res;
         }
@@ -3184,7 +3209,7 @@ private:
 
     void cnm_stats_begin(server_slot & slot) {
         llama_moe_cache_stats c = {};
-        if (llama_moe_cache_get_stats(ctx_tgt, &c) == 0) {
+        if (!params_base.cnm_profiles_dir.empty() && llama_moe_cache_get_stats(ctx_tgt, &c) == 0) {
             slot.stats.cnm_set  = true;
             slot.stats.cnm_base = c;
         }
@@ -3377,7 +3402,7 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
-                    res->metrics.cnm_cache   = llama_moe_cache_get_stats(ctx_tgt, &res->metrics.cnm) == 0;
+                    res->metrics.cnm_cache   = !params_base.cnm_profiles_dir.empty() && llama_moe_cache_get_stats(ctx_tgt, &res->metrics.cnm) == 0;
                     res->metrics.cnm_bias_switches = cnm_bias_switches;
 
                     if (task.metrics_reset_bucket) {
@@ -6054,7 +6079,13 @@ void server_routes::init_routes() {
                 res->error(format_error_response("This server does not support the cnm endpoints. Start it with `--cnm-profiles DIR`", ERROR_TYPE_NOT_SUPPORTED));
                 return res;
             }
-            json body = req.body.empty() ? json::object() : json::parse(req.body);
+            json body;
+            try {
+                body = req.body.empty() ? json::object() : json::parse(req.body);
+            } catch (const std::exception & e) {
+                res->error(format_error_response(std::string("invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
             if (!body.is_object()) {
                 res->error(format_error_response("Request body must be an object", ERROR_TYPE_INVALID_REQUEST));
                 return res;

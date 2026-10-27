@@ -129,6 +129,8 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             sys.stderr.write("proxy: " + fmt % args + "\n")
 
     def _read_body(self):
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            raise ValueError("chunked request bodies are not supported")
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n else b""
 
@@ -191,20 +193,44 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                 obj = {"profile": profile, "prefetch": bool(self.cfg.prefetch)}
                 if self.cfg.bias is not None:
                     obj["bias"] = self.cfg.bias
-                st, res = self.up.call("POST", "/cnm/bias", obj)
+                try:
+                    st, res = self.up.call("POST", "/cnm/bias", obj)
+                except OSError as e:
+                    st, res = 599, repr(e)
                 rec["profile"] = profile
                 rec["switch"] = res if st == 200 else {"status": st, "error": res}
-            s0 = self.up.call("GET", "/cnm/stats")[1].get("moe_cache") if self.cfg.stats else None
+                if st != 200 and self.cfg.strict:
+                    # never forward under an unknown profile: the arm would be silently contaminated
+                    msg = json.dumps({"error": {"message": f"phase_proxy: /cnm/bias failed: {st} {res}"}}).encode()
+                    self.send_response(502)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(msg)))
+                    self.end_headers()
+                    self.wfile.write(msg)
+                    rec["status"] = 502
+                    return
+            s0 = self._stats()
             t0 = time.time()
             status = self._forward(body)
             rec["wall_s"] = round(time.time() - t0, 3)
             rec["status"] = status
             if self.cfg.stats:
-                s1 = self.up.call("GET", "/cnm/stats")[1].get("moe_cache")
-                rec["cache"] = delta(s0, s1)
+                rec["cache"] = delta(s0, self._stats())
         finally:
             if lock:
                 lock.release()
+            self._log(rec)
+
+    def _stats(self):
+        if not self.cfg.stats:
+            return None
+        try:
+            st, r = self.up.call("GET", "/cnm/stats")
+            return r.get("moe_cache") if st == 200 and isinstance(r, dict) else None
+        except OSError:
+            return None
+
+    def _log(self, rec):
         if self.cfg.log:
             with self.log_lock, open(self.cfg.log, "a") as f:
                 f.write(json.dumps(rec) + "\n")
@@ -237,6 +263,8 @@ def main():
     ap.add_argument("--prefetch", action="store_true", help="prefetch the profile's experts before each request")
     ap.add_argument("--no-stats", dest="stats", action="store_false", help="do not read /cnm/stats around requests")
     ap.add_argument("--no-serialize", dest="serialize", action="store_false")
+    ap.add_argument("--no-strict", dest="strict", action="store_false",
+                    help="forward even when the profile switch failed (default: answer 502)")
     ap.add_argument("--log", default=None)
     ap.add_argument("--timeout", type=float, default=3600)
     ap.add_argument("--verbose", action="store_true")

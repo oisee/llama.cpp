@@ -501,7 +501,11 @@ task_params eval_llama_cmpl_schema(
     // [CNM] router bias profile for this request (see --cnm-profiles)
     params.cnm_bias_profile = json_value(data, "cnm_bias_profile", std::string());
     if (data.contains("cnm_bias") && data.at("cnm_bias").is_number()) {
-        params.cnm_bias = data.at("cnm_bias").get<float>();
+        const double d = data.at("cnm_bias").get<double>();
+        if (!std::isfinite(d) || d > 0 || d < -1e30) {
+            throw std::invalid_argument("cnm_bias must be a finite number <= 0");
+        }
+        params.cnm_bias = (float) d;
     }
     params.cnm_prefetch = json_value(data, "cnm_prefetch", false);
 

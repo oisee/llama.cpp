@@ -1144,6 +1144,9 @@ extern "C" {
     // Synchronizes ctx; call between decodes. Returns 0 on success, -1 on error (logged, offsets unchanged).
     LLAMA_API int32_t llama_set_expert_bias(struct llama_context * ctx, const char * path, float bias);
 
+    // true if the model was loaded with CNM_EXPERT_BIAS_RUNTIME=1 (llama_set_expert_bias can switch plans)
+    LLAMA_API bool llama_model_cnm_bias_runtime(const struct llama_model * model);
+
     // Parse and cache a plan without applying it (validation at startup). Returns 0 on success, -1 on error.
     LLAMA_API int32_t llama_load_expert_bias(struct llama_context * ctx, const char * path, float bias);
 

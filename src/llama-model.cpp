@@ -170,7 +170,7 @@ static std::map<int, std::vector<float>> cnm_parse_expert_bias(const llama_model
         return f;
     };
     const bool has_override = !std::isnan(scalar_override);
-    if (has_override && scalar_override > 0) { fail("bias override must be nonpositive"); }
+    if (has_override && (!std::isfinite(scalar_override) || scalar_override > 0)) { fail("bias override must be finite and nonpositive"); }
     const bool has_scalar = has_override || plan.contains("bias");
     const float scalar = has_override ? scalar_override : (plan.contains("bias") ? parse_bias(plan["bias"]) : 0.0f);
     auto parse_id = [&](const std::string & key, size_t limit) -> int {
@@ -268,8 +268,12 @@ static void cnm_apply_expert_bias(llama_model_base & model) {
     }
     model.cnm_bias_runtime = runtime;
     if (path) {
-        LLAMA_LOG_INFO("CNM_EXPERT_BIAS: %zu layers, %zu offset vectors%s, plan sha256 %s\n", values.size(), n,
-                       runtime ? " (runtime switching enabled)" : "", sha.c_str());
+        if (runtime) {
+            LLAMA_LOG_INFO("CNM_EXPERT_BIAS: %zu layers, %zu offset vectors (runtime switching enabled), plan sha256 %s\n",
+                           values.size(), n, sha.c_str());
+        } else {
+            LLAMA_LOG_INFO("CNM_EXPERT_BIAS: %zu layers, %zu nonzero vectors, plan sha256 %s\n", values.size(), n, sha.c_str());
+        }
     } else {
         LLAMA_LOG_INFO("CNM_EXPERT_BIAS_RUNTIME: %zu zero offset vectors, runtime switching enabled\n", n);
     }
@@ -280,6 +284,10 @@ std::map<int, std::vector<float>> llama_cnm_parse_expert_bias(const llama_model 
         throw std::runtime_error("llama_set_expert_bias: requires uncut qwen4exp with ungrouped softmax routing");
     }
     return cnm_parse_expert_bias(model, path, scalar_override, "llama_set_expert_bias");
+}
+
+bool llama_model_cnm_bias_runtime(const llama_model * model) {
+    return model->cnm_bias_runtime;
 }
 
 void llama_cnm_write_expert_bias(const llama_model & model, const std::map<int, std::vector<float>> & values) {
