@@ -2411,7 +2411,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         auto * device = ggml_backend_buffer_is_host(gate_inp->buffer) ? nullptr : ggml_backend_buft_get_device(ggml_backend_buffer_get_type(gate_inp->buffer));
         auto dispatch = llama_tier_dispatch_create(*tier_layer, hparams.swiglu_clamp_exp[il], arch == LLM_ARCH_GLM5_NEXT,
-                n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads, device, res->tier_runtime);
+                n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads, device, res->tier_runtime, cparams.op_offload);
         auto * tier_input = ggml_cont(ctx0, cur);
         cb(tier_input, "ffn_moe_tier_input", il);
         experts = llama_tier_dispatch_build(*dispatch, ctx0, tier_input, ggml_cont(ctx0, selected_experts));

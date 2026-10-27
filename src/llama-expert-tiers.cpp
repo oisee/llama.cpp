@@ -2,6 +2,7 @@
 #include "llama-model.h"
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
+#include "ggml-cpp.h"
 #include "llama-impl.h"
 
 #include <algorithm>
@@ -24,10 +25,12 @@ struct llama_tier_runtime {
     struct device_workspace {
         ggml_backend_t backend = nullptr;
         ggml_backend_buffer_t buffer = nullptr;
+        ggml_backend_buffer_t expert_buffer = nullptr;
         ggml_threadpool_t threadpool = nullptr;
         ~device_workspace() {
             if (backend) { ggml_backend_synchronize(backend); }
             ggml_backend_buffer_free(buffer);
+            ggml_backend_buffer_free(expert_buffer);
             ggml_backend_free(backend);
             ggml_threadpool_free(threadpool);
         }
@@ -111,6 +114,7 @@ struct llama_tier_dispatch {
     ggml_backend_dev_t layer_device;
     bool instrument;
     bool cuda_arithmetic;
+    bool prefill_offload;
     const float * reciprocal_table = nullptr;
     const float * exponential_table = nullptr;
     std::string dump_directory;
@@ -120,10 +124,13 @@ struct llama_tier_dispatch {
     std::vector<int32_t> source_map;
     uint64_t hot_pairs = 0, cold_pairs = 0, cold_input_bytes = 0, cold_output_bytes = 0;
     uint64_t hot_jobs = 0, cold_jobs = 0, cold_skips = 0;
+    uint64_t offload_jobs = 0, expert_weight_transfer_bytes = 0;
     double body_ms = 0, control_ms = 0;
     std::vector<uint8_t> scatter_coverage;
 
-    llama_tier_dispatch(const llama_expert_tiers & layer, float clamp, bool glm, int threads, ggml_backend_dev_t layer_device, std::shared_ptr<llama_tier_runtime> runtime) : layer(layer), clamp(clamp), glm(glm), threads(threads), layer_device(layer_device), instrument(std::getenv("CNM_TIER_TRACE") != nullptr), cuda_arithmetic(std::getenv("CNM_TIER_CUDA_ARITH") != nullptr), runtime(std::move(runtime)) {
+    llama_tier_dispatch(const llama_expert_tiers & layer, float clamp, bool glm, int threads, ggml_backend_dev_t layer_device, std::shared_ptr<llama_tier_runtime> runtime, bool op_offload) : layer(layer), clamp(clamp), glm(glm), threads(threads), layer_device(layer_device), instrument(std::getenv("CNM_TIER_TRACE") != nullptr), cuda_arithmetic(std::getenv("CNM_TIER_CUDA_ARITH") != nullptr), runtime(std::move(runtime)) {
+        const char * offload = std::getenv("CNM_TIER_PREFILL_OFFLOAD");
+        prefill_offload = op_offload && !cuda_arithmetic && (!offload || std::strcmp(offload, "0") != 0);
         if (const char * path = std::getenv("CNM_TIER_DUMP")) { dump_directory = path; }
         if (cuda_arithmetic && std::getenv("CNM_TIER_CUDA_SFU") && layer_device) {
             for (const auto * bank : {&layer.hot, &layer.cold}) {
@@ -307,7 +314,7 @@ struct llama_tier_dispatch {
     }
 
     void run_bank(const llama_expert_bank & bank, std::map<int64_t, std::unique_ptr<bank_graph>> & variants, const std::vector<int64_t> & original_pairs,
-            const std::vector<int32_t> & original_local, ggml_tensor * dst) {
+            const std::vector<int32_t> & original_local, ggml_tensor * dst, bool is_cold = false) {
         if (original_pairs.empty()) { return; }
         auto * src = dst->src[0];
         const int64_t d = dst->ne[0], k = dst->ne[1];
@@ -336,7 +343,7 @@ struct llama_tier_dispatch {
                     if (auto * pinned = runtime->stage(src)) {
                         ggml_backend_tensor_get(src, pinned, token * src->nb[1], bytes);
                         std::memcpy(x.data(), pinned, bytes);
-                        if (&bank == &layer.cold) { cold_input_bytes += bytes; }
+                        if (is_cold) { cold_input_bytes += bytes; }
                     } else { ggml_backend_tensor_get(src, x.data(), token * src->nb[1], bytes); }
                 }
             }
@@ -376,7 +383,7 @@ struct llama_tier_dispatch {
             if (ggml_backend_graph_compute(g.backend, g.graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("expert tiers: bank execution failed"); }
             dump_bank(bank, g, pairs, local, begin, k);
             if (instrument) { body_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(); }
-            if (&bank == &layer.cold) { ++cold_jobs; } else { ++hot_jobs; }
+            if (is_cold) { ++cold_jobs; } else { ++hot_jobs; }
             // Copy disjoint slot vectors without tier reduction or cancellation.
             auto * view_ctx = ggml_init({ggml_tensor_overhead() * 2 * n, nullptr, true});
             if (!view_ctx) { throw std::bad_alloc(); }
@@ -392,11 +399,100 @@ struct llama_tier_dispatch {
                     auto * pinned = runtime->stage(dst);
                     ggml_backend_tensor_get(from, pinned, 0, bytes);
                     ggml_backend_tensor_set(to, pinned, 0, bytes);
-                    if (&bank == &layer.cold) { cold_output_bytes += bytes; }
+                    if (is_cold) { cold_output_bytes += bytes; }
                 } else { ggml_backend_tensor_copy(from, to); }
             }
             ggml_free(view_ctx);
             begin += n;
+        }
+    }
+
+    bool can_offload(const llama_expert_bank & bank, ggml_tensor * dst) const {
+        if (!prefill_offload || !layer_device || !ggml_backend_buffer_is_host(bank.down->buffer) ||
+                std::string(ggml_backend_dev_name(layer_device)).find("CUDA") != 0 || dst->ne[2] <= 1) {
+            return false;
+        }
+        // Ask CUDA with the logical token batch, not the expanded token/expert pairs.
+        ggml_tensor op = {};
+        op.op = GGML_OP_MUL_MAT_ID;
+        op.ne[2] = dst->ne[2];
+        if (!ggml_backend_dev_offload_op(layer_device, &op)) { return false; }
+        op.src[1] = dst->src[0];
+        for (auto * weight : {bank.gate, bank.up, bank.gate_up, bank.down}) {
+            if (!weight) { continue; }
+            op.src[0] = weight;
+            if (!ggml_is_contiguous(weight) || !ggml_backend_dev_supports_op(layer_device, &op)) { return false; }
+        }
+        return true;
+    }
+
+    void run_cold(const std::vector<int64_t> & pairs, const std::vector<int32_t> & local, ggml_tensor * dst) {
+        if (pairs.empty()) { return; }
+        const auto & bank = layer.cold;
+        if (!can_offload(bank, dst)) { run_bank(bank, cold, pairs, local, dst, true); return; }
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<int32_t> used = local;
+        std::sort(used.begin(), used.end());
+        used.erase(std::unique(used.begin(), used.end()), used.end());
+        std::vector<int32_t> remap(bank.ids.size(), -1), packed_ids;
+        for (size_t i = 0; i < used.size(); ++i) { remap.at(used[i]) = int32_t(i); }
+        packed_ids.reserve(local.size());
+        for (auto id : local) { packed_ids.push_back(remap.at(id)); }
+
+        ggml_context_ptr ctx(ggml_init({4 * ggml_tensor_overhead(), nullptr, true}));
+        if (!ctx) { throw std::bad_alloc(); }
+        llama_expert_bank packed;
+        for (auto id : used) { packed.ids.push_back(bank.ids.at(id)); }
+        auto tensor = [&](ggml_tensor * weight) -> ggml_tensor * {
+            if (!weight) { return nullptr; }
+            auto * result = ggml_new_tensor_3d(ctx.get(), weight->type, weight->ne[0], weight->ne[1], used.size());
+            ggml_set_name(result, weight->name);
+            return result;
+        };
+        packed.gate = tensor(bank.gate); packed.up = tensor(bank.up);
+        packed.gate_up = tensor(bank.gate_up); packed.down = tensor(bank.down);
+        auto & workspace = runtime->get(layer_device, threads);
+        const size_t required = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), ggml_backend_get_default_buffer_type(workspace.backend));
+        if (!workspace.expert_buffer || ggml_backend_buffer_get_size(workspace.expert_buffer) < required) {
+            ggml_backend_synchronize(workspace.backend);
+            ggml_backend_buffer_free(workspace.expert_buffer);
+            workspace.expert_buffer = ggml_backend_alloc_buffer(workspace.backend, required);
+            if (!workspace.expert_buffer) {
+                LLAMA_LOG_WARN("expert tiers: prefill buffer allocation failed (%zu bytes), using CPU\n", required);
+                run_bank(bank, cold, pairs, local, dst, true);
+                return;
+            }
+        }
+        auto allocator = ggml_tallocr_new(workspace.expert_buffer);
+        uint64_t transferred = 0;
+        for (const auto & projection : {std::make_pair(bank.gate, packed.gate), std::make_pair(bank.up, packed.up),
+                std::make_pair(bank.gate_up, packed.gate_up), std::make_pair(bank.down, packed.down)}) {
+            auto * from = projection.first;
+            auto * to = projection.second;
+            if (!from) { continue; }
+            if (ggml_tallocr_alloc(&allocator, to) != GGML_STATUS_SUCCESS) { throw std::bad_alloc(); }
+            // Coalesce adjacent expert IDs. Each selected expert is uploaded once per projection.
+            for (size_t first = 0; first < used.size();) {
+                size_t last = first + 1;
+                while (last < used.size() && used[last] == used[last - 1] + 1) { ++last; }
+                const size_t bytes = (last - first) * from->nb[2];
+                ggml_backend_tensor_set_async(workspace.backend, to, (const char *) from->data + used[first] * from->nb[2], first * to->nb[2], bytes);
+                transferred += bytes;
+                first = last;
+            }
+        }
+        ggml_backend_synchronize(workspace.backend);
+        const double upload_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        // Graph metadata is local: weight headers refer to the shared, reusable device buffer.
+        std::map<int64_t, std::unique_ptr<bank_graph>> variants;
+        run_bank(packed, variants, pairs, packed_ids, dst, true);
+        ++offload_jobs;
+        expert_weight_transfer_bytes += transferred;
+        if (instrument) {
+            LLAMA_LOG_INFO("tiers prefill_offload layer=%s tokens=%lld pairs=%zu union=%zu weight_bytes=%llu buffer_bytes=%zu upload_ms=%.3f total_ms=%.3f device=%s\n",
+                bank.down->name, (long long) dst->ne[2], pairs.size(), used.size(), (unsigned long long) transferred,
+                ggml_backend_buffer_get_size(workspace.expert_buffer), upload_ms,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), ggml_backend_dev_name(layer_device));
         }
     }
 
@@ -428,7 +524,7 @@ struct llama_tier_dispatch {
             if (cold.empty()) { ++self.cold_skips; }
             if (self.instrument || !self.dump_directory.empty()) { self.scatter_coverage.assign(k * t, 0); }
             self.run_bank(self.layer.hot, self.hot, hot, hot_ids, dst);
-            self.run_bank(self.layer.cold, self.cold, cold, cold_ids, dst);
+            self.run_cold(cold, cold_ids, dst);
             if (!self.scatter_coverage.empty() && std::find(self.scatter_coverage.begin(), self.scatter_coverage.end(), uint8_t(0)) != self.scatter_coverage.end()) {
                 throw std::runtime_error("expert tiers: missing output slot");
             }
@@ -436,8 +532,9 @@ struct llama_tier_dispatch {
             if (self.instrument) {
                 LLAMA_LOG_INFO("tiers hot=%zu cold=%zu cold_input_bytes=%llu cold_output_bytes=%llu\n", hot.size(), cold.size(),
                     (unsigned long long) (self.cold_input_bytes - input_before), (unsigned long long) (self.cold_output_bytes - output_before));
-                LLAMA_LOG_INFO("tiers counters hot_jobs=%llu cold_jobs=%llu cold_skips=%llu expert_weight_transfer_bytes=0 body_ms=%.3f control_ms=%.3f\n",
-                    (unsigned long long) self.hot_jobs, (unsigned long long) self.cold_jobs, (unsigned long long) self.cold_skips, self.body_ms, self.control_ms);
+                LLAMA_LOG_INFO("tiers counters hot_jobs=%llu cold_jobs=%llu cold_skips=%llu offload_jobs=%llu expert_weight_transfer_bytes=%llu body_ms=%.3f control_ms=%.3f\n",
+                    (unsigned long long) self.hot_jobs, (unsigned long long) self.cold_jobs, (unsigned long long) self.cold_skips,
+                    (unsigned long long) self.offload_jobs, (unsigned long long) self.expert_weight_transfer_bytes, self.body_ms, self.control_ms);
             }
             return GGML_STATUS_SUCCESS;
         } catch (const std::exception & error) {
@@ -451,8 +548,8 @@ std::shared_ptr<llama_tier_runtime> llama_tier_runtime_create(size_t bytes, size
     return std::make_shared<llama_tier_runtime>(bytes, staging_bytes);
 }
 
-std::shared_ptr<llama_tier_dispatch> llama_tier_dispatch_create(const llama_expert_tiers & layer, float clamp, bool glm, int threads, ggml_backend_dev_t layer_device, std::shared_ptr<llama_tier_runtime> runtime) {
-    return std::make_shared<llama_tier_dispatch>(layer, clamp, glm, threads, layer_device, std::move(runtime));
+std::shared_ptr<llama_tier_dispatch> llama_tier_dispatch_create(const llama_expert_tiers & layer, float clamp, bool glm, int threads, ggml_backend_dev_t layer_device, std::shared_ptr<llama_tier_runtime> runtime, bool op_offload) {
+    return std::make_shared<llama_tier_dispatch>(layer, clamp, glm, threads, layer_device, std::move(runtime), op_offload);
 }
 
 ggml_tensor * llama_tier_dispatch_build(llama_tier_dispatch & dispatch, ggml_context * ctx, ggml_tensor * input, ggml_tensor * ids) {
