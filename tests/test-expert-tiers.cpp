@@ -16,9 +16,10 @@ static void check(bool ok, const char * message) {
     if (!ok) { throw std::runtime_error(message); }
 }
 
-static int uploads = 0;
+static int uploads = 0, overlaps = 0;
 static void log_capture(ggml_log_level, const char * text, void *) {
     if (std::strstr(text, "tiers prefill_offload")) { ++uploads; }
+    if (std::strstr(text, "tiers decode_timing") && std::strstr(text, "overlap=1")) { ++overlaps; }
     std::fputs(text, stderr);
 }
 
@@ -160,6 +161,8 @@ int main(int argc, char ** argv) {
         ggml_backend_cpu_set_n_threads(cpu.get(), 2);
         const char * flag = std::getenv("CNM_TIER_PREFILL_OFFLOAD");
         const bool enabled = cuda && !std::getenv("CNM_TIER_CUDA_ARITH") && (!flag || std::strcmp(flag, "0") != 0);
+        const char * concurrent = std::getenv("CNM_TIER_OVERLAP");
+        const bool overlap = cuda && (!concurrent || std::strcmp(concurrent, "0") != 0);
         const char * threshold = std::getenv("GGML_OP_OFFLOAD_MIN_BATCH");
         const int minimum = threshold ? std::atoi(threshold) : 32;
         for (auto type : {GGML_TYPE_F32, GGML_TYPE_IQ3_S}) {
@@ -171,10 +174,11 @@ int main(int argc, char ** argv) {
                     replay tiers(f, cpu.get(), backend, false, tokens, shared);
                     for (int pattern : {0, 1, 4, 0, 2, 3, 1}) {
                         const auto reference = native.run(pattern);
-                        const int before = uploads;
+                        const int before = uploads, overlap_before = overlaps;
                         const auto actual = tiers.run(pattern);
                         const bool expected = enabled && tokens > 1 && tokens >= minimum && pattern != 2;
                         check(uploads - before == int(expected), "offload threshold or exact-mode gate");
+                        check(overlaps - overlap_before == int(overlap && tokens == 1 && pattern != 2 && pattern != 3), "decode overlap or empty-bank gate");
                         double error = 0;
                         for (size_t i = 0; i < actual.size(); ++i) {
                             check(std::isfinite(actual[i]) && std::isfinite(reference[i]), "nonfinite output");
@@ -188,10 +192,20 @@ int main(int argc, char ** argv) {
                 const int before = uploads;
                 disabled.run(1);
                 check(uploads == before, "global op_offload=false was ignored");
+                if (cuda && type == GGML_TYPE_IQ3_S && std::getenv("CNM_TIER_CUDA_ARITH")) {
+                    replay failure(f, cpu.get(), backend, false, 1, shared);
+                    auto * weight = f.tiers.cold.gate ? f.tiers.cold.gate : f.tiers.cold.gate_up;
+                    weight->type = GGML_TYPE_Q4_0;
+                    bool rejected = false;
+                    try { failure.run(0); } catch (const std::exception &) { rejected = true; }
+                    weight->type = type;
+                    check(rejected, "unsupported exact CPU projection was accepted");
+                    failure.run(0);
+                }
             }
         }
         ggml_quantize_free();
-        std::puts("PASS: native oracle, threshold, exact/disable gates, changing unions, merged gate/up, shared workspace");
+        std::puts("PASS: native oracle, threshold, exact/disable gates, changing unions, merged gate/up, shared workspace, decode overlap, worker failure recovery");
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

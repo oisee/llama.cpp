@@ -15,6 +15,11 @@
 #include <cstdint>
 #include <limits>
 #include <chrono>
+#include <condition_variable>
+#include <future>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <map>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +27,41 @@
 #include <vector>
 
 struct llama_tier_runtime {
+    struct gpu_worker {
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::packaged_task<void()> task;
+        bool stopping = false;
+        std::thread thread;
+        gpu_worker() : thread([this] {
+            for (;;) {
+                std::packaged_task<void()> next;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    ready.wait(lock, [this] { return stopping || task.valid(); });
+                    if (!task.valid()) { return; }
+                    next = std::move(task);
+                }
+                next();
+            }
+        }) {}
+        ~gpu_worker() {
+            { std::lock_guard<std::mutex> lock(mutex); stopping = true; }
+            ready.notify_one();
+            thread.join();
+        }
+        std::future<void> submit(std::function<void()> body) {
+            std::packaged_task<void()> next(std::move(body));
+            auto result = next.get_future();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                GGML_ASSERT(!task.valid());
+                task = std::move(next);
+            }
+            ready.notify_one();
+            return result;
+        }
+    };
     struct device_workspace {
         ggml_backend_t backend = nullptr;
         ggml_backend_buffer_t buffer = nullptr;
@@ -42,6 +82,7 @@ struct llama_tier_runtime {
     size_t bytes, staging_bytes;
     std::map<ggml_backend_dev_t, std::unique_ptr<device_workspace>> devices;
     std::map<ggml_backend_dev_t, std::unique_ptr<host_staging>> staging;
+    std::unique_ptr<gpu_worker> worker;
     llama_tier_runtime(size_t bytes, size_t staging_bytes) : bytes(bytes), staging_bytes(staging_bytes) {}
     void * stage(ggml_tensor * tensor) {
         if (ggml_backend_buffer_is_host(tensor->buffer)) { return nullptr; }
@@ -57,6 +98,8 @@ struct llama_tier_runtime {
         return ggml_backend_buffer_get_base(host->buffer);
     }
     device_workspace & get(ggml_backend_dev_t device, int threads) {
+        auto found = devices.find(device);
+        if (found != devices.end()) { return *found->second; }
         auto & workspace = devices[device];
         if (!workspace) {
             workspace = std::make_unique<device_workspace>();
@@ -115,6 +158,7 @@ struct llama_tier_dispatch {
     bool instrument;
     bool cuda_arithmetic;
     bool prefill_offload;
+    bool overlap;
     const float * reciprocal_table = nullptr;
     const float * exponential_table = nullptr;
     std::string dump_directory;
@@ -124,13 +168,15 @@ struct llama_tier_dispatch {
     std::vector<int32_t> source_map;
     uint64_t hot_pairs = 0, cold_pairs = 0, cold_input_bytes = 0, cold_output_bytes = 0;
     uint64_t hot_jobs = 0, cold_jobs = 0, cold_skips = 0;
-    uint64_t offload_jobs = 0, expert_weight_transfer_bytes = 0;
-    double body_ms = 0, control_ms = 0;
+    uint64_t offload_jobs = 0, expert_weight_transfer_bytes = 0, overlap_jobs = 0;
+    double hot_body_ms = 0, cold_body_ms = 0, control_ms = 0;
     std::vector<uint8_t> scatter_coverage;
 
     llama_tier_dispatch(const llama_expert_tiers & layer, float clamp, bool glm, int threads, ggml_backend_dev_t layer_device, std::shared_ptr<llama_tier_runtime> runtime, bool op_offload) : layer(layer), clamp(clamp), glm(glm), threads(threads), layer_device(layer_device), instrument(std::getenv("CNM_TIER_TRACE") != nullptr), cuda_arithmetic(std::getenv("CNM_TIER_CUDA_ARITH") != nullptr), runtime(std::move(runtime)) {
         const char * offload = std::getenv("CNM_TIER_PREFILL_OFFLOAD");
         prefill_offload = op_offload && !cuda_arithmetic && (!offload || std::strcmp(offload, "0") != 0);
+        const char * concurrent = std::getenv("CNM_TIER_OVERLAP");
+        overlap = !concurrent || std::strcmp(concurrent, "0") != 0;
         if (const char * path = std::getenv("CNM_TIER_DUMP")) { dump_directory = path; }
         if (cuda_arithmetic && std::getenv("CNM_TIER_CUDA_SFU") && layer_device) {
             for (const auto * bank : {&layer.hot, &layer.cold}) {
@@ -314,7 +360,8 @@ struct llama_tier_dispatch {
     }
 
     void run_bank(const llama_expert_bank & bank, std::map<int64_t, std::unique_ptr<bank_graph>> & variants, const std::vector<int64_t> & original_pairs,
-            const std::vector<int32_t> & original_local, ggml_tensor * dst, bool is_cold = false) {
+            const std::vector<int32_t> & original_local, ggml_tensor * dst, bool is_cold = false,
+            const float * staged_input = nullptr, float * deferred_output = nullptr) {
         if (original_pairs.empty()) { return; }
         auto * src = dst->src[0];
         const int64_t d = dst->ne[0], k = dst->ne[1];
@@ -335,6 +382,7 @@ struct llama_tier_dispatch {
         // Group each expert and balance large groups so no tail switches from tiled dots to vec_dot.
         // Read each needed token once per bank invocation, including across tiles.
         std::map<int64_t, std::vector<float>> inputs;
+        if (staged_input) { inputs.emplace(0, std::vector<float>(staged_input, staged_input + d)); }
         if (cpu) {
             for (auto q : pairs) {
                 const int64_t token = q / k;
@@ -382,8 +430,15 @@ struct llama_tier_dispatch {
             const auto started = instrument ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (ggml_backend_graph_compute(g.backend, g.graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("expert tiers: bank execution failed"); }
             dump_bank(bank, g, pairs, local, begin, k);
-            if (instrument) { body_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(); }
+            if (instrument) { (is_cold ? cold_body_ms : hot_body_ms) += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(); }
             if (is_cold) { ++cold_jobs; } else { ++hot_jobs; }
+            if (deferred_output) {
+                for (int64_t i = 0; i < n; ++i) {
+                    ggml_backend_tensor_get(g.output, deferred_output + pairs[begin + i] * d, i * g.output->nb[2], bytes);
+                }
+                begin += n;
+                continue;
+            }
             // Copy disjoint slot vectors without tier reduction or cancellation.
             auto * view_ctx = ggml_init({ggml_tensor_overhead() * 2 * n, nullptr, true});
             if (!view_ctx) { throw std::bad_alloc(); }
@@ -404,6 +459,74 @@ struct llama_tier_dispatch {
             }
             ggml_free(view_ctx);
             begin += n;
+        }
+    }
+
+    void run_banks(const std::vector<int64_t> & hot_pairs, const std::vector<int32_t> & hot_ids,
+            const std::vector<int64_t> & cold_pairs, const std::vector<int32_t> & cold_ids, ggml_tensor * dst) {
+        using clock = std::chrono::steady_clock;
+        auto stamp = [&] { return instrument ? clock::now() : clock::time_point{}; };
+        auto elapsed = [&](clock::time_point start) { return instrument ? std::chrono::duration<double, std::milli>(clock::now() - start).count() : 0.0; };
+        const auto started = stamp();
+        const size_t bytes = dst->ne[0] * sizeof(float);
+        const bool concurrent = overlap && dst->ne[2] == 1 && !hot_pairs.empty() && !cold_pairs.empty() &&
+            layer_device && std::string(ggml_backend_dev_name(layer_device)).find("CUDA") == 0 &&
+            !ggml_backend_buffer_is_host(layer.hot.down->buffer) && ggml_backend_buffer_is_host(layer.cold.down->buffer) &&
+            !ggml_backend_buffer_is_host(dst->buffer) && size_t(dst->ne[1]) <= runtime->staging_bytes / bytes;
+        double hot_ms = 0, cold_ms = 0, stage_ms = 0, scatter_ms = 0, input_ms = 0;
+        if (concurrent) {
+            // Create both workspaces before the worker starts reading the device map.
+            runtime->get(layer_device, threads);
+            runtime->get(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), threads);
+            std::vector<float> input(dst->ne[0]);
+            auto * src = dst->src[0];
+            auto * pinned = runtime->stage(src);
+            auto * output = static_cast<float *>(runtime->stage(dst));
+            if (!runtime->worker) { runtime->worker = std::make_unique<llama_tier_runtime::gpu_worker>(); }
+            stage_ms = elapsed(started);
+            auto pending = runtime->worker->submit([&] {
+                const auto start = stamp();
+                run_bank(layer.hot, hot, hot_pairs, hot_ids, dst);
+                hot_ms = elapsed(start);
+            });
+            try {
+                const auto start = stamp();
+                // CUDA host copies use the caller's per-thread stream, independent of the hot backend.
+                if (pinned) {
+                    ggml_backend_tensor_get(src, pinned, 0, bytes);
+                    std::memcpy(input.data(), pinned, bytes);
+                    cold_input_bytes += bytes;
+                } else { ggml_backend_tensor_get(src, input.data(), 0, bytes); }
+                input_ms = elapsed(start);
+                run_bank(layer.cold, cold, cold_pairs, cold_ids, dst, true, input.data(), output);
+                cold_ms = elapsed(start);
+            } catch (...) {
+                // The worker captures this stack. Keep it alive on CPU failures as well.
+                pending.wait();
+                throw;
+            }
+            pending.get();
+            const auto scatter_start = stamp();
+            for (auto q : cold_pairs) {
+                if (!scatter_coverage.empty() && scatter_coverage.at(q)++) { throw std::runtime_error("expert tiers: duplicate output slot"); }
+                ggml_backend_tensor_set(dst, output + q * dst->ne[0], q * bytes, bytes);
+                cold_output_bytes += bytes;
+            }
+            scatter_ms = elapsed(scatter_start);
+            ++overlap_jobs;
+        } else {
+            auto start = stamp();
+            run_bank(layer.hot, hot, hot_pairs, hot_ids, dst);
+            hot_ms = elapsed(start);
+            start = stamp();
+            run_cold(cold_pairs, cold_ids, dst);
+            cold_ms = elapsed(start);
+        }
+        if (instrument && dst->ne[2] == 1) {
+            const auto * weight = layer.hot.down ? layer.hot.down : layer.cold.down;
+            LLAMA_LOG_INFO("tiers decode_timing layer=%s overlap=%d hot=%zu cold=%zu hot_ms=%.6f cold_ms=%.6f input_ms=%.6f stage_ms=%.6f scatter_ms=%.6f sum_ms=%.6f max_ms=%.6f wall_ms=%.6f\n",
+                weight->name, int(concurrent), hot_pairs.size(), cold_pairs.size(), hot_ms, cold_ms, input_ms, stage_ms, scatter_ms,
+                stage_ms + hot_ms + cold_ms + scatter_ms, stage_ms + std::max(hot_ms, cold_ms) + scatter_ms, elapsed(started));
         }
     }
 
@@ -523,8 +646,7 @@ struct llama_tier_dispatch {
             if (self.instrument) { self.control_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(); }
             if (cold.empty()) { ++self.cold_skips; }
             if (self.instrument || !self.dump_directory.empty()) { self.scatter_coverage.assign(k * t, 0); }
-            self.run_bank(self.layer.hot, self.hot, hot, hot_ids, dst);
-            self.run_cold(cold, cold_ids, dst);
+            self.run_banks(hot, hot_ids, cold, cold_ids, dst);
             if (!self.scatter_coverage.empty() && std::find(self.scatter_coverage.begin(), self.scatter_coverage.end(), uint8_t(0)) != self.scatter_coverage.end()) {
                 throw std::runtime_error("expert tiers: missing output slot");
             }
@@ -532,9 +654,10 @@ struct llama_tier_dispatch {
             if (self.instrument) {
                 LLAMA_LOG_INFO("tiers hot=%zu cold=%zu cold_input_bytes=%llu cold_output_bytes=%llu\n", hot.size(), cold.size(),
                     (unsigned long long) (self.cold_input_bytes - input_before), (unsigned long long) (self.cold_output_bytes - output_before));
-                LLAMA_LOG_INFO("tiers counters hot_jobs=%llu cold_jobs=%llu cold_skips=%llu offload_jobs=%llu expert_weight_transfer_bytes=%llu body_ms=%.3f control_ms=%.3f\n",
+                LLAMA_LOG_INFO("tiers counters hot_jobs=%llu cold_jobs=%llu cold_skips=%llu offload_jobs=%llu expert_weight_transfer_bytes=%llu overlap_jobs=%llu body_ms=%.3f control_ms=%.3f\n",
                     (unsigned long long) self.hot_jobs, (unsigned long long) self.cold_jobs, (unsigned long long) self.cold_skips,
-                    (unsigned long long) self.offload_jobs, (unsigned long long) self.expert_weight_transfer_bytes, self.body_ms, self.control_ms);
+                    (unsigned long long) self.offload_jobs, (unsigned long long) self.expert_weight_transfer_bytes,
+                    (unsigned long long) self.overlap_jobs, self.hot_body_ms + self.cold_body_ms, self.control_ms);
             }
             return GGML_STATUS_SUCCESS;
         } catch (const std::exception & error) {

@@ -22,3 +22,11 @@ CNM_TIER_TRACE=1 CNM_TIER_CUDA_ARITH=1 CNM_TIER_CUDA_SFU=1 build/bin/test-expert
 ```
 
 The CPU and RTX 2070 tests cover F32/IQ3_S, separate/merged gate-up, batches 1/31/32/64/256, sparse and changing expert unions, empty selections, shared buffers, and global/specific switches. A small quantized Qwen fixture matches all-CUDA bitwise on three different 64-position excerpts; an F32 GLM fixture has mean KL around 3e-15, comparable to its native CPU control. Exact-mode prefill outputs are bitwise unchanged by the new switch on both fixtures. These are synthetic arithmetic checks, not real-model language-quality or i7 performance results.
+
+# Decode overlap
+
+`CNM_TIER_OVERLAP=1` (default) runs a nonempty CUDA hot bank on a persistent worker while the caller copies the cold input and computes CPU cold experts. CPU output remains in pinned host staging until the hot work completes, then is written to the original disjoint slots. The external expert reduction and both banks' tiling/arithmetic policies are unchanged. `CNM_TIER_OVERLAP=0` selects the original serial bank order. Empty banks and CPU-only layers do not create worker jobs.
+
+The input copy uses the caller's CUDA per-thread stream, independent of the hot backend stream. Workspaces and pinned staging are initialized before submission; cold execution does not mutate GPU state. Failure paths wait for the worker before releasing captured inputs. The worker is shared across layers in a runtime and is joined before its backend workspaces are destroyed.
+
+`CNM_TIER_TRACE=1` adds per-layer hot/cold/input/staging/scatter time, measured wall time, their sum and their maximum. Timing includes host launch and synchronization costs; it is not a CUDA-kernel-only duration. Sixteen teacher-forced comparisons against the preserved prefill engine cover both fixtures, fast/exact arithmetic, three texts and 256 decode positions: all 1,060,864 decode values match bitwise, as do prefill logits. Explicit CPU projection failure followed by recovery also passes.
