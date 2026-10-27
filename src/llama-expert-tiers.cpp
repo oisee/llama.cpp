@@ -41,6 +41,7 @@ struct llama_tier_runtime {
     std::unique_ptr<llama_remote_peer> remote;
     std::vector<float> remote_reciprocal, remote_exponential;
     std::string calibration;
+    std::map<const float *, std::string> calibration_ids;
     std::map<const ggml_tensor *, std::string> remote_identities;
     size_t bytes, staging_bytes;
     std::map<ggml_backend_dev_t, std::unique_ptr<device_workspace>> devices;
@@ -428,7 +429,9 @@ struct llama_tier_dispatch {
     llama_remote_call remote_send(ggml_tensor * dst, const std::vector<int64_t> & pairs, const std::vector<int32_t> & local) {
         llama_remote_call c; c.d = dst->ne[0]; c.k = dst->ne[1]; c.t = dst->ne[2];
         c.bank = layer.cold.down->name; c.identity = bank_identity(); c.clamp = clamp; c.glm = glm;
-        if (cuda_arithmetic) {
+        bool quantized = false;
+        for (auto * weight : {layer.cold.gate, layer.cold.up, layer.cold.gate_up, layer.cold.down}) { quantized |= weight && ggml_is_quantized(weight->type); }
+        if (cuda_arithmetic && quantized) {
             using query_t = int (*)(ggml_backend_dev_t, ggml_type, int64_t, int64_t);
             auto query = reinterpret_cast<query_t>(ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(layer_device), "ggml_backend_cuda_tier_quant_policy"));
             if (!query || !reciprocal_table || !exponential_table) { throw std::runtime_error("expert remote: exact policy unavailable"); }
@@ -440,10 +443,11 @@ struct llama_tier_dispatch {
                 }
             }
             c.warps = c.t == 1 ? 4 : 1;
-            if (runtime->calibration.empty()) {
-                runtime->calibration = hash_sha256_hex(reciprocal_table, (size_t(1) << 23) * sizeof(float)) + hash_sha256_hex(exponential_table, (size_t(1) << 24) * sizeof(float));
+            auto & calibration = runtime->calibration_ids[reciprocal_table];
+            if (calibration.empty()) {
+                calibration = hash_sha256_hex(reciprocal_table, (size_t(1) << 23) * sizeof(float)) + hash_sha256_hex(exponential_table, (size_t(1) << 24) * sizeof(float));
             }
-            c.calibration = runtime->calibration;
+            c.calibration = calibration;
         }
         std::vector<uint8_t> seen(c.t, 0);
         for (size_t i = 0; i < pairs.size(); ++i) {
