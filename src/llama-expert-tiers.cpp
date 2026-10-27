@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <string>
@@ -75,6 +76,7 @@ struct llama_tier_runtime {
 
 namespace {
 constexpr int64_t pair_tile = 256;
+std::atomic<uint64_t> capture_sequence{0};
 
 struct bank_graph {
     ggml_context * ctx = nullptr;
@@ -109,7 +111,6 @@ struct llama_tier_dispatch {
     bool instrument;
     bool cuda_arithmetic;
     std::string dump_directory;
-    uint64_t dump_sequence = 0;
     ggml_backend_sched_dispatch boundary;
     std::shared_ptr<llama_tier_runtime> runtime;
     std::map<int64_t, std::unique_ptr<bank_graph>> hot, cold;
@@ -244,7 +245,7 @@ struct llama_tier_dispatch {
             const std::vector<int32_t> & local, size_t begin, int64_t k) {
         if (dump_directory.empty()) { return; }
         std::filesystem::create_directories(dump_directory);
-        const std::string prefix = dump_directory + "/" + bank.down->name + ".t" + std::to_string(g.logical_tokens) + ".d" + std::to_string(reinterpret_cast<std::uintptr_t>(this)) + "." + std::to_string(dump_sequence++);
+        const std::string prefix = dump_directory + "/" + bank.down->name + ".t" + std::to_string(g.logical_tokens) + ".capture" + std::to_string(capture_sequence.fetch_add(1, std::memory_order_relaxed));
         std::ofstream mapping(prefix + ".pairs");
         for (int64_t i = 0; i < g.pairs; ++i) {
             const auto q = pairs[begin + i];
