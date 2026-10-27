@@ -153,7 +153,7 @@ struct llama_tier_dispatch {
     ggml_tensor * projection(bank_graph & graph, ggml_tensor * weight, ggml_tensor * input, int index, bool cpu) {
         const bool supported = weight->type == GGML_TYPE_IQ3_S || weight->type == GGML_TYPE_IQ3_XXS ||
             weight->type == GGML_TYPE_IQ4_XS || weight->type == GGML_TYPE_IQ4_NL ||
-            weight->type == GGML_TYPE_IQ2_S || weight->type == GGML_TYPE_Q2_0;
+            weight->type == GGML_TYPE_IQ2_S || weight->type == GGML_TYPE_IQ2_XS || weight->type == GGML_TYPE_Q2_0;
         if (cpu && layer_device && cuda_arithmetic && ggml_is_quantized(weight->type) && !supported) {
             throw std::runtime_error("expert tiers: unsupported CPU/CUDA compatibility weight type");
         }
