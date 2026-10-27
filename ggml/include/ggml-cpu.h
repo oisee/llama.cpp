@@ -24,8 +24,20 @@ extern "C" {
         bool use_ref;
     };
 
-    // Experimental tier-only custom op. userdata points to 1 (MMVQ) or 2 (MMQ D4).
+    // Experimental tier-only custom ops. userdata uses the policy or parameters below.
+    struct ggml_cpu_tier_quant_policy {
+        int kind;
+        const float * reciprocal;
+        int mmvq_warps;
+    };
+    struct ggml_cpu_tier_swiglu_params {
+        const float * reciprocal;
+        const float * exponential;
+        float clamp;
+        bool glm;
+    };
     GGML_BACKEND_API void ggml_cpu_tier_quant_matmul(struct ggml_tensor * dst, int ith, int nth, void * userdata);
+    GGML_BACKEND_API void ggml_cpu_tier_swiglu(struct ggml_tensor * dst, int ith, int nth, void * userdata);
 
     // numa strategies
     enum ggml_numa_strategy {

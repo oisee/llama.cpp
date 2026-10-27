@@ -10,6 +10,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include <cctype>
 #include <string>
@@ -43,18 +44,83 @@
 #endif
 
 // Portable tier-only integer dots with the CUDA activation representation.
+static float ggml_cpu_tier_reciprocal(float x, const float * table) {
+    uint32_t bits; std::memcpy(&bits, &x, sizeof(bits));
+    const uint32_t sign = bits & 0x80000000u;
+    const int exponent = (bits >> 23) & 255;
+    uint32_t result;
+    if (exponent == 0) { result = sign | 0x7f800000u; }
+    else if (exponent == 255) { result = (bits & 0x7fffffu) ? bits : sign; }
+    else {
+        float normalized = table[bits & 0x7fffffu];
+        std::memcpy(&result, &normalized, sizeof(result));
+        const int scaled_exponent = int(result >> 23) + 127 - exponent;
+        if (scaled_exponent <= 0) { result = sign; }
+        else if (scaled_exponent >= 255) { result = sign | 0x7f800000u; }
+        else { result = sign | (uint32_t(scaled_exponent) << 23) | (result & 0x7fffffu); }
+    }
+    float value; std::memcpy(&value, &result, sizeof(value)); return value;
+}
+
+static float ggml_cpu_tier_ftz(float x) {
+    return std::abs(x) < std::numeric_limits<float>::min() ? std::copysign(0.0f, x) : x;
+}
+
+void ggml_cpu_tier_swiglu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const auto & params = *static_cast<const ggml_cpu_tier_swiglu_params *>(userdata);
+    const auto * gate = dst->src[0]; const auto * up = dst->src[1];
+    GGML_ASSERT(params.reciprocal && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, dst) && ggml_is_contiguous(dst));
+    GGML_ASSERT(gate->ne[3] == 1);
+    auto * output = static_cast<float *>(dst->data);
+    for (int64_t i = ith; i < ggml_nelements(dst); i += nth) {
+        const int64_t c = i % gate->ne[0], q = i / gate->ne[0];
+        const int64_t y = q % gate->ne[1], z = q / gate->ne[1];
+        float g, u;
+        std::memcpy(&g, static_cast<const char *>(gate->data) + c * gate->nb[0] + y * gate->nb[1] + z * gate->nb[2], sizeof(g));
+        std::memcpy(&u, static_cast<const char *>(up->data) + c * up->nb[0] + y * up->nb[1] + z * up->nb[2], sizeof(u));
+        g = ggml_cpu_tier_ftz(g); u = ggml_cpu_tier_ftz(u);
+        if (params.clamp > 1e-6f && params.glm) { g = std::min(g, params.clamp); }
+        const float argument = ggml_cpu_tier_ftz(-g * 1.4426950408889634f);
+        float exponential;
+        if (params.exponential && std::isfinite(argument) && std::abs(argument) < 128.0f) {
+            const int integral = int(std::abs(argument));
+            const float fraction = std::abs(argument) - integral;
+            const float * thresholds = params.exponential + (argument < 0 ? (size_t(1) << 23) : 0);
+            // Invert the sampled output thresholds, then restore the integer exponent.
+            const uint32_t index = std::upper_bound(thresholds, thresholds + (size_t(1) << 23), fraction) - thresholds - 1;
+            uint32_t bits = argument < 0 ? 0x3f800000u - index : 0x3f800000u + index;
+            const int exponent = int(bits >> 23) + (argument < 0 ? -integral : integral);
+            if (exponent <= 0) { bits = 0; }
+            else if (exponent >= 255) { bits = 0x7f800000u; }
+            else { bits = (uint32_t(exponent) << 23) | (bits & 0x7fffffu); }
+            std::memcpy(&exponential, &bits, sizeof(exponential));
+        } else { exponential = std::exp2(argument); }
+        float silu = ggml_cpu_tier_ftz(g * ggml_cpu_tier_reciprocal(1.0f + exponential, params.reciprocal));
+        if (params.clamp > 1e-6f) {
+            if (!params.glm) { silu = std::min(silu, params.clamp); }
+            u = std::clamp(u, -params.clamp, params.clamp);
+        }
+        output[i] = ggml_cpu_tier_ftz(silu * u);
+    }
+}
+
 void ggml_cpu_tier_quant_matmul(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    const int policy = *static_cast<const int *>(userdata);
+    const auto & config = *static_cast<const ggml_cpu_tier_quant_policy *>(userdata);
+    const int policy = config.kind;
     GGML_ASSERT(policy == 1 || policy == 2);
+    const int lanes = config.mmvq_warps == 4 ? 128 : 32;
     const auto * weight = dst->src[0];
     GGML_ASSERT(weight->type == GGML_TYPE_IQ3_S || weight->type == GGML_TYPE_IQ3_XXS ||
-                weight->type == GGML_TYPE_IQ4_XS || weight->type == GGML_TYPE_IQ4_NL);
+                weight->type == GGML_TYPE_IQ4_XS || weight->type == GGML_TYPE_IQ4_NL ||
+                weight->type == GGML_TYPE_IQ2_S || weight->type == GGML_TYPE_Q2_0);
     const auto * input = dst->src[1];
     const auto * ids = dst->src[2];
     const auto * traits = ggml_get_type_traits(weight->type);
     const int64_t width = weight->ne[0], rows = weight->ne[1], block = traits->blck_size;
     GGML_ASSERT(width % 32 == 0 && width % block == 0 && block <= 256);
     GGML_ASSERT(input->type == GGML_TYPE_F32 && input->ne[0] == width && input->ne[1] == 1);
+    GGML_ASSERT(input->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1 && dst->ne[3] == 1);
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[0] == 1 && ids->ne[1] == input->ne[2]);
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[0] == rows && dst->ne[1] == 1 && dst->ne[2] == input->ne[2]);
     std::vector<int8_t> codes(width);
@@ -68,18 +134,20 @@ void ggml_cpu_tier_quant_matmul(ggml_tensor * dst, int ith, int nth, void * user
         for (int64_t c = 0; c < width; c += 32) {
             float amax = 0;
             for (int i = 0; i < 32; ++i) { amax = std::max(amax, std::abs(x[c + i])); }
-            const float d = amax / 127.0f;
-            const float inverse = amax ? 127.0f / amax : 0;
-            scales[c / 32] = policy == 1 ? ggml_fp16_to_fp32(ggml_fp32_to_fp16(d)) : (amax ? 1.0f / inverse : 0);
+            const float d = config.reciprocal ? amax * (1.0f / 127.0f) : amax / 127.0f;
+            const float inverse = amax ? (config.reciprocal ? 127.0f * ggml_cpu_tier_reciprocal(amax, config.reciprocal) : 127.0f / amax) : 0;
+            scales[c / 32] = policy == 1 ? ggml_fp16_to_fp32(ggml_fp32_to_fp16(d)) :
+                (amax ? (config.reciprocal ? ggml_cpu_tier_reciprocal(inverse, config.reciprocal) : 1.0f / inverse) : 0);
             for (int i = 0; i < 32; ++i) {
-                codes[c + i] = amax ? int8_t(std::round(policy == 1 ? x[c + i] / d : x[c + i] * inverse)) : 0;
+                codes[c + i] = amax ? int8_t(std::round(policy == 1 ?
+                    (config.reciprocal ? x[c + i] * ggml_cpu_tier_reciprocal(d, config.reciprocal) : x[c + i] / d) : x[c + i] * inverse)) : 0;
             }
         }
         auto * out = reinterpret_cast<float *>(static_cast<char *>(dst->data) + pair * dst->nb[2]);
         for (int64_t row = ith; row < rows; row += nth) {
             const auto * raw = static_cast<const char *>(weight->data) + expert * weight->nb[2] + row * weight->nb[1];
             float sum = 0;
-            std::array<float, 32> partial{};
+            std::array<float, 128> partial{};
             for (int64_t c = 0; c < width; c += block) {
                 const auto * packed = raw + (c / block) * traits->type_size;
                 ggml_fp16_t half;
@@ -90,6 +158,24 @@ void ggml_cpu_tier_quant_matmul(ggml_tensor * dst, int ith, int nth, void * user
                 if (d == 0) { continue; }
                 for (int64_t group = 0; group < block; group += 32) {
                     const int g = group / 32;
+                    const float activation_scale = scales[(c + group) / 32];
+                    if (weight->type == GGML_TYPE_IQ2_S) {
+                        const auto * b = reinterpret_cast<const block_iq2_s *>(packed);
+                        const int ls0 = b->scales[g] & 15, ls1 = b->scales[g] >> 4;
+                        const float s0 = (ls0 * d + d / 2) / 4, s1 = (ls1 * d + d / 2) / 4;
+                        int dots[2] = {};
+                        for (int i = 0; i < 32; ++i) {
+                            const float scale = i < 16 ? s0 : s1;
+                            dots[i / 16] += int(std::round(decoded[group + i] / scale)) * codes[c + group + i];
+                        }
+                        if (policy == 2) {
+                            sum = std::fma(std::fma(float(dots[0]), s0, float(dots[1]) * s1), activation_scale, sum);
+                        } else {
+                            const int dot = (dots[0] * ls0 + dots[1] * ls1 + (dots[0] + dots[1]) / 2) / 4;
+                            partial[((c + group) / 32) % lanes] += (d * activation_scale) * dot;
+                        }
+                        continue;
+                    }
                     float subscale = d;
                     int multiplier = 1;
                     if (weight->type == GGML_TYPE_IQ3_S) {
@@ -111,17 +197,23 @@ void ggml_cpu_tier_quant_matmul(ggml_tensor * dst, int ith, int nth, void * user
                     for (int i = 0; i < 32; ++i) {
                         dots[(i % 16) / 8] += int(std::round(decoded[group + i] / subscale)) * codes[c + group + i];
                     }
-                    const float activation_scale = scales[(c + group) / 32];
                     if (policy == 2) {
                         sum = std::fma(float(dots[0] + dots[1]) * subscale, activation_scale, sum);
+                    } else if (weight->type == GGML_TYPE_IQ3_XXS) {
+                        const int dot = dots[0] + dots[1], ls = (multiplier - 1) / 2;
+                        const int scaled = (ls * dot + dot / 2) / 2;
+                        partial[((c + group) / 32) % lanes] += ((4 * d) * activation_scale) * scaled;
                     } else if (weight->type == GGML_TYPE_IQ4_NL) {
-                        for (int i = 0; i < 2; ++i) { partial[((c + group) / 16 + i) % 32] += (d * activation_scale) * dots[i]; }
+                        for (int i = 0; i < 2; ++i) { partial[((c + group) / 16 + i) % lanes] += (d * activation_scale) * dots[i]; }
                     } else {
-                        partial[((c + group) / 32) % 32] += (d * activation_scale) * ((dots[0] + dots[1]) * multiplier);
+                        partial[((c + group) / 32) % lanes] += (d * activation_scale) * ((dots[0] + dots[1]) * multiplier);
                     }
                 }
             }
             if (policy == 1) {
+                for (int warp = 1; warp < lanes / 32; ++warp) {
+                    for (int i = 0; i < 32; ++i) { partial[i] += partial[warp * 32 + i]; }
+                }
                 for (int offset = 16; offset; offset /= 2) {
                     auto previous = partial;
                     for (int i = 0; i < 32; ++i) { partial[i] = previous[i] + previous[i ^ offset]; }

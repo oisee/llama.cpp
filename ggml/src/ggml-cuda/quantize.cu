@@ -1,6 +1,52 @@
 #include "quantize.cuh"
 #include <cstdint>
 
+static __global__ void tier_reciprocal_table(float * values) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const float x = __uint_as_float(0x3f800000u + i);
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    values[i] = y;
+}
+
+void ggml_cuda_tier_reciprocal_table(float * host) {
+    constexpr size_t bytes = (size_t(1) << 23) * sizeof(float);
+    float * device = nullptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&device), bytes));
+    tier_reciprocal_table<<<(1 << 23) / 256, 256>>>(device);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(host, device, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(device));
+}
+
+static __global__ void tier_exponential_thresholds(float * thresholds, bool negative) {
+    // Store the first F32 input reaching each F32 output on [0, 1] or [-1, 0].
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const float target = __uint_as_float(negative ? 0x3f800000u - i : 0x3f800000u + i);
+    uint32_t lo = 0, hi = 0x3f800000u;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        const float argument = negative ? -__uint_as_float(mid) : __uint_as_float(mid);
+        float value;
+        asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(value) : "f"(argument));
+        if (negative ? value <= target : value >= target) { hi = mid; }
+        else { lo = mid + 1; }
+    }
+    thresholds[i] = __uint_as_float(lo);
+}
+
+void ggml_cuda_tier_exponential_table(float * host) {
+    constexpr size_t entries = size_t(1) << 23;
+    float * device = nullptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&device), entries * sizeof(float)));
+    for (int negative = 0; negative < 2; ++negative) {
+        tier_exponential_thresholds<<<entries / 256, 256>>>(device, negative != 0);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(host + negative * entries, device, entries * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+    CUDA_CHECK(cudaFree(device));
+}
+
 #if defined(BLACKWELL_MMA_AVAILABLE)
 // this maps to 256-bit loads in PTX on supported devices,
 // and otherwise falls back to 2 128-bit loads

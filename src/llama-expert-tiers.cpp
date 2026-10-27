@@ -89,7 +89,8 @@ struct bank_graph {
     ggml_tensor * gate = nullptr;
     ggml_tensor * up = nullptr;
     ggml_tensor * activated = nullptr;
-    std::array<int, 3> quant_policy{};
+    std::array<ggml_cpu_tier_quant_policy, 3> quant_policy{};
+    ggml_cpu_tier_swiglu_params swiglu{};
     int64_t pairs = 0;
     int64_t logical_tokens = 0;
     const ggml_tensor * source = nullptr;
@@ -110,6 +111,8 @@ struct llama_tier_dispatch {
     ggml_backend_dev_t layer_device;
     bool instrument;
     bool cuda_arithmetic;
+    const float * reciprocal_table = nullptr;
+    const float * exponential_table = nullptr;
     std::string dump_directory;
     ggml_backend_sched_dispatch boundary;
     std::shared_ptr<llama_tier_runtime> runtime;
@@ -122,6 +125,21 @@ struct llama_tier_dispatch {
 
     llama_tier_dispatch(const llama_expert_tiers & layer, float clamp, bool glm, int threads, ggml_backend_dev_t layer_device, std::shared_ptr<llama_tier_runtime> runtime) : layer(layer), clamp(clamp), glm(glm), threads(threads), layer_device(layer_device), instrument(std::getenv("CNM_TIER_TRACE") != nullptr), cuda_arithmetic(std::getenv("CNM_TIER_CUDA_ARITH") != nullptr), runtime(std::move(runtime)) {
         if (const char * path = std::getenv("CNM_TIER_DUMP")) { dump_directory = path; }
+        if (cuda_arithmetic && std::getenv("CNM_TIER_CUDA_SFU") && layer_device) {
+            for (const auto * bank : {&layer.hot, &layer.cold}) {
+                if (!bank->down || !ggml_backend_buffer_is_host(bank->down->buffer)) { continue; }
+                const auto * gate = bank->gate ? bank->gate : bank->gate_up;
+                if (!ggml_is_quantized(bank->down->type) && (!gate || !ggml_is_quantized(gate->type))) { continue; }
+                using table_t = const float * (*)(ggml_backend_dev_t);
+                auto reg = ggml_backend_dev_backend_reg(layer_device);
+                auto rcp = reinterpret_cast<table_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_tier_reciprocal"));
+                auto ex2 = reinterpret_cast<table_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_tier_exponential"));
+                reciprocal_table = rcp ? rcp(layer_device) : nullptr;
+                exponential_table = ex2 ? ex2(layer_device) : nullptr;
+                if (!reciprocal_table || !exponential_table) { throw std::runtime_error("expert tiers: SFU policy requires Turing CUDA"); }
+                break;
+            }
+        }
         boundary = {execute, this};
         int32_t count = 0;
         for (const auto * bank : {&layer.hot, &layer.cold}) {
@@ -134,7 +152,8 @@ struct llama_tier_dispatch {
 
     ggml_tensor * projection(bank_graph & graph, ggml_tensor * weight, ggml_tensor * input, int index, bool cpu) {
         const bool supported = weight->type == GGML_TYPE_IQ3_S || weight->type == GGML_TYPE_IQ3_XXS ||
-            weight->type == GGML_TYPE_IQ4_XS || weight->type == GGML_TYPE_IQ4_NL;
+            weight->type == GGML_TYPE_IQ4_XS || weight->type == GGML_TYPE_IQ4_NL ||
+            weight->type == GGML_TYPE_IQ2_S || weight->type == GGML_TYPE_Q2_0;
         if (cpu && layer_device && cuda_arithmetic && ggml_is_quantized(weight->type) && !supported) {
             throw std::runtime_error("expert tiers: unsupported CPU/CUDA compatibility weight type");
         }
@@ -143,8 +162,10 @@ struct llama_tier_dispatch {
             auto query = reinterpret_cast<query_t>(ggml_backend_reg_get_proc_address(
                     ggml_backend_dev_backend_reg(layer_device), "ggml_backend_cuda_tier_quant_policy"));
             if (!query) { throw std::runtime_error("expert tiers: CUDA arithmetic policy unavailable"); }
-            graph.quant_policy[index] = query(layer_device, weight->type, graph.source->ne[1], layer.hot.ids.size() + layer.cold.ids.size());
-            if (!graph.quant_policy[index]) { throw std::runtime_error("expert tiers: unsupported CUDA arithmetic policy"); }
+            graph.quant_policy[index].kind = query(layer_device, weight->type, graph.source->ne[1], layer.hot.ids.size() + layer.cold.ids.size());
+            if (!graph.quant_policy[index].kind) { throw std::runtime_error("expert tiers: unsupported CUDA arithmetic policy"); }
+            graph.quant_policy[index].reciprocal = reciprocal_table;
+            graph.quant_policy[index].mmvq_warps = reciprocal_table && graph.source->ne[1] == 1 ? 4 : 1;
             ggml_tensor * args[] = {weight, input, graph.ids};
             return ggml_custom_4d(graph.ctx, GGML_TYPE_F32, weight->ne[1], 1, graph.pairs, 1,
                     args, 3, ggml_cpu_tier_quant_matmul, GGML_N_TASKS_MAX, &graph.quant_policy[index]);
@@ -216,6 +237,12 @@ struct llama_tier_dispatch {
             activated = glm ? ggml_swiglu_clamp(ctx, gate, up, clamp) :
                 ggml_mul(ctx, ggml_clamp(ctx, ggml_silu(ctx, gate), -INFINITY, clamp), ggml_clamp(ctx, up, -clamp, clamp));
         } else { activated = ggml_swiglu_split(ctx, gate, up); }
+        if (g->quant_policy[0].reciprocal) {
+            g->swiglu = {g->quant_policy[0].reciprocal, exponential_table, bank.gate ? clamp : 0.0f, glm};
+            ggml_tensor * args[] = {gate, up};
+            activated = ggml_custom_4d(ctx, GGML_TYPE_F32, gate->ne[0], 1, n, 1,
+                args, 2, ggml_cpu_tier_swiglu, GGML_N_TASKS_MAX, &g->swiglu);
+        }
         g->gate = gate; g->up = up; g->activated = activated;
         g->output = projection(*g, bank.down, activated, 2, cpu);
         ggml_set_output(g->output);
@@ -253,7 +280,7 @@ struct llama_tier_dispatch {
         }
         std::ofstream policy(prefix + ".policy");
         policy << ggml_backend_name(g.backend) << " logical_tokens=" << g.logical_tokens << " packed_pairs=" << g.pairs << "\n";
-        policy << "quant_policy=" << g.quant_policy[0] << "," << g.quant_policy[1] << "," << g.quant_policy[2] << "\n";
+        policy << "quant_policy=" << g.quant_policy[0].kind << "," << g.quant_policy[1].kind << "," << g.quant_policy[2].kind << " reciprocal=" << bool(g.quant_policy[0].reciprocal) << "\n";
         for (auto * weight : {bank.gate, bank.up, bank.gate_up, bank.down}) {
             if (weight) { policy << weight->name << " " << ggml_type_name(weight->type) << " " << weight->data << " " << weight->nb[2] << "\n"; }
         }

@@ -5400,6 +5400,33 @@ struct ggml_backend_cuda_device_context {
     int op_offload_min_batch_size;
 };
 
+// Model-independent instruction tables, shared by contexts on the same Turing device.
+static const float * ggml_backend_cuda_tier_sfu_table(ggml_backend_dev_t dev, bool exponential) {
+    auto * ctx = static_cast<ggml_backend_cuda_device_context *>(dev->context);
+    if (ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_TURING) { return nullptr; }
+    static std::mutex mutex;
+    static std::map<std::pair<int, bool>, std::vector<float>> tables;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto & values = tables[{ctx->device, exponential}];
+    if (values.empty()) {
+        values.resize(size_t(exponential ? 2 : 1) << 23);
+        const int previous = ggml_cuda_get_device();
+        ggml_cuda_set_device(ctx->device);
+        if (exponential) { ggml_cuda_tier_exponential_table(values.data()); }
+        else { ggml_cuda_tier_reciprocal_table(values.data()); }
+        ggml_cuda_set_device(previous);
+    }
+    return values.data();
+}
+
+static const float * ggml_backend_cuda_tier_reciprocal(ggml_backend_dev_t dev) {
+    return ggml_backend_cuda_tier_sfu_table(dev, false);
+}
+
+static const float * ggml_backend_cuda_tier_exponential(ggml_backend_dev_t dev) {
+    return ggml_backend_cuda_tier_sfu_table(dev, true);
+}
+
 // 0: unsupported, 1: MMVQ Q8_1 with half scales, 2: MMQ D4 with float scales.
 static int ggml_backend_cuda_tier_quant_policy(ggml_backend_dev_t dev, ggml_type type, int64_t tokens, int64_t experts) {
     auto * ctx = static_cast<ggml_backend_cuda_device_context *>(dev->context);
@@ -6227,6 +6254,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_tier_quant_policy") == 0) {
         return (void *)ggml_backend_cuda_tier_quant_policy;
+    }
+    if (strcmp(name, "ggml_backend_cuda_tier_reciprocal") == 0) {
+        return (void *)ggml_backend_cuda_tier_reciprocal;
+    }
+    if (strcmp(name, "ggml_backend_cuda_tier_exponential") == 0) {
+        return (void *)ggml_backend_cuda_tier_exponential;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
