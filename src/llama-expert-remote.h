@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <array>
 #include <string>
 #include <vector>
 #include <functional>
@@ -14,6 +15,9 @@ struct llama_remote_call {
     std::vector<uint32_t> pairs, ids, tokens;
     std::vector<float> input, output;
     uint64_t compute_ns = 0;
+    std::array<uint32_t, 3> policies{};
+    uint32_t warps = 1;
+    std::string calibration;
 };
 
 class llama_remote_peer {

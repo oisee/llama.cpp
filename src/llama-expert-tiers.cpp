@@ -39,6 +39,8 @@ struct llama_tier_runtime {
         ~host_staging() { ggml_backend_buffer_free(buffer); }
     };
     std::unique_ptr<llama_remote_peer> remote;
+    std::vector<float> remote_reciprocal, remote_exponential;
+    std::string calibration;
     std::map<const ggml_tensor *, std::string> remote_identities;
     size_t bytes, staging_bytes;
     std::map<ggml_backend_dev_t, std::unique_ptr<device_workspace>> devices;
@@ -115,6 +117,9 @@ struct llama_tier_dispatch {
     ggml_backend_dev_t layer_device;
     bool instrument;
     bool cuda_arithmetic;
+    bool remote_policy_active = false;
+    std::array<uint32_t, 3> remote_policy{};
+    int remote_warps = 1;
     const float * reciprocal_table = nullptr;
     const float * exponential_table = nullptr;
     std::string dump_directory;
@@ -129,7 +134,7 @@ struct llama_tier_dispatch {
 
     llama_tier_dispatch(const llama_expert_tiers & layer, float clamp, bool glm, int threads, ggml_backend_dev_t layer_device, std::shared_ptr<llama_tier_runtime> runtime) : layer(layer), clamp(clamp), glm(glm), threads(threads), layer_device(layer_device), instrument(std::getenv("CNM_TIER_TRACE") != nullptr), cuda_arithmetic(std::getenv("CNM_TIER_CUDA_ARITH") != nullptr), runtime(std::move(runtime)) {
         if (const char * endpoint = std::getenv("CNM_TIER_REMOTE")) {
-            if (cuda_arithmetic) { throw std::runtime_error("expert remote: CUDA arithmetic policy transport is not qualified"); }
+            if (cuda_arithmetic && (!layer_device || !std::getenv("CNM_TIER_CUDA_SFU"))) { throw std::runtime_error("expert remote: exact policy needs a CUDA router and SFU calibration"); }
             if (!this->runtime->remote) { this->runtime->remote = std::make_unique<llama_remote_peer>(endpoint); }
         }
         if (const char * path = std::getenv("CNM_TIER_DUMP")) { dump_directory = path; }
@@ -162,18 +167,21 @@ struct llama_tier_dispatch {
         const bool supported = weight->type == GGML_TYPE_IQ3_S || weight->type == GGML_TYPE_IQ3_XXS ||
             weight->type == GGML_TYPE_IQ4_XS || weight->type == GGML_TYPE_IQ4_NL ||
             weight->type == GGML_TYPE_IQ2_S || weight->type == GGML_TYPE_IQ2_XS || weight->type == GGML_TYPE_Q2_0;
-        if (cpu && layer_device && cuda_arithmetic && ggml_is_quantized(weight->type) && !supported) {
+        if (cpu && (layer_device || remote_policy_active) && cuda_arithmetic && ggml_is_quantized(weight->type) && !supported) {
             throw std::runtime_error("expert tiers: unsupported CPU/CUDA compatibility weight type");
         }
-        if (cpu && layer_device && supported && cuda_arithmetic) {
-            using query_t = int (*)(ggml_backend_dev_t, ggml_type, int64_t, int64_t);
-            auto query = reinterpret_cast<query_t>(ggml_backend_reg_get_proc_address(
-                    ggml_backend_dev_backend_reg(layer_device), "ggml_backend_cuda_tier_quant_policy"));
-            if (!query) { throw std::runtime_error("expert tiers: CUDA arithmetic policy unavailable"); }
-            graph.quant_policy[index].kind = query(layer_device, weight->type, graph.source->ne[1], layer.hot.ids.size() + layer.cold.ids.size());
+        if (cpu && (layer_device || remote_policy_active) && supported && cuda_arithmetic) {
+            if (remote_policy_active) { graph.quant_policy[index].kind = remote_policy[index]; }
+            else {
+                using query_t = int (*)(ggml_backend_dev_t, ggml_type, int64_t, int64_t);
+                auto query = reinterpret_cast<query_t>(ggml_backend_reg_get_proc_address(
+                        ggml_backend_dev_backend_reg(layer_device), "ggml_backend_cuda_tier_quant_policy"));
+                if (!query) { throw std::runtime_error("expert tiers: CUDA arithmetic policy unavailable"); }
+                graph.quant_policy[index].kind = query(layer_device, weight->type, graph.source->ne[1], layer.hot.ids.size() + layer.cold.ids.size());
+            }
             if (!graph.quant_policy[index].kind) { throw std::runtime_error("expert tiers: unsupported CUDA arithmetic policy"); }
             graph.quant_policy[index].reciprocal = reciprocal_table;
-            graph.quant_policy[index].mmvq_warps = reciprocal_table && graph.source->ne[1] == 1 ? 4 : 1;
+            graph.quant_policy[index].mmvq_warps = remote_policy_active ? remote_warps : (reciprocal_table && graph.source->ne[1] == 1 ? 4 : 1);
             ggml_tensor * args[] = {weight, input, graph.ids};
             return ggml_custom_4d(graph.ctx, GGML_TYPE_F32, weight->ne[1], 1, graph.pairs, 1,
                     args, 3, ggml_cpu_tier_quant_matmul, GGML_N_TASKS_MAX, &graph.quant_policy[index]);
@@ -420,6 +428,23 @@ struct llama_tier_dispatch {
     llama_remote_call remote_send(ggml_tensor * dst, const std::vector<int64_t> & pairs, const std::vector<int32_t> & local) {
         llama_remote_call c; c.d = dst->ne[0]; c.k = dst->ne[1]; c.t = dst->ne[2];
         c.bank = layer.cold.down->name; c.identity = bank_identity(); c.clamp = clamp; c.glm = glm;
+        if (cuda_arithmetic) {
+            using query_t = int (*)(ggml_backend_dev_t, ggml_type, int64_t, int64_t);
+            auto query = reinterpret_cast<query_t>(ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(layer_device), "ggml_backend_cuda_tier_quant_policy"));
+            if (!query || !reciprocal_table || !exponential_table) { throw std::runtime_error("expert remote: exact policy unavailable"); }
+            std::array<ggml_tensor *, 3> weights{layer.cold.gate ? layer.cold.gate : layer.cold.gate_up, layer.cold.up, layer.cold.down};
+            for (size_t i = 0; i < weights.size(); ++i) {
+                if (weights[i] && ggml_is_quantized(weights[i]->type)) {
+                    c.policies[i] = query(layer_device, weights[i]->type, c.t, layer.hot.ids.size() + layer.cold.ids.size());
+                    if (!c.policies[i]) { throw std::runtime_error("expert remote: unsupported exact policy"); }
+                }
+            }
+            c.warps = c.t == 1 ? 4 : 1;
+            if (runtime->calibration.empty()) {
+                runtime->calibration = hash_sha256_hex(reciprocal_table, (size_t(1) << 23) * sizeof(float)) + hash_sha256_hex(exponential_table, (size_t(1) << 24) * sizeof(float));
+            }
+            c.calibration = runtime->calibration;
+        }
         std::vector<uint8_t> seen(c.t, 0);
         for (size_t i = 0; i < pairs.size(); ++i) {
             c.pairs.push_back(pairs[i]); c.ids.push_back(layer.cold.ids.at(local[i]));
@@ -470,10 +495,20 @@ struct llama_tier_dispatch {
             if (self.instrument || !self.dump_directory.empty()) { self.scatter_coverage.assign(k * t, 0); }
             llama_remote_call remote;
             const bool use_remote = self.runtime->remote && !cold.empty();
+            const auto invoke_started = std::chrono::steady_clock::now();
             if (use_remote) { remote = self.remote_send(dst, cold, cold_ids); }
+            const auto hot_started = std::chrono::steady_clock::now();
             self.run_bank(self.layer.hot, self.hot, hot, hot_ids, dst);
-            if (use_remote) { self.remote_receive(dst, remote); }
-            else { self.run_bank(self.layer.cold, self.cold, cold, cold_ids, dst); }
+            const auto hot_finished = std::chrono::steady_clock::now();
+            if (use_remote) {
+                self.remote_receive(dst, remote);
+                if (self.instrument) {
+                    const auto finished = std::chrono::steady_clock::now();
+                    LLAMA_LOG_INFO("tiers remote timing bank=%s invoke_ms=%.6f hot_ms=%.6f join_ms=%.6f worker_ms=%.6f\n", remote.bank.c_str(),
+                        std::chrono::duration<double, std::milli>(finished - invoke_started).count(), std::chrono::duration<double, std::milli>(hot_finished - hot_started).count(),
+                        std::chrono::duration<double, std::milli>(finished - hot_finished).count(), remote.compute_ns / 1e6);
+                }
+            } else { self.run_bank(self.layer.cold, self.cold, cold, cold_ids, dst); }
             if (!self.scatter_coverage.empty() && std::find(self.scatter_coverage.begin(), self.scatter_coverage.end(), uint8_t(0)) != self.scatter_coverage.end()) {
                 throw std::runtime_error("expert tiers: missing output slot");
             }
@@ -513,20 +548,81 @@ void llama_tier_remote_serve(llama_model & model, const char * endpoint, int thr
         std::shared_ptr<llama_tier_runtime> runtime;
         std::unique_ptr<llama_tier_dispatch> dispatch;
     };
+    size_t max_d = 0, max_ff = 0;
+    for (const auto & layer : model.expert_tiers) {
+        if (layer.cold.down) { max_d = std::max(max_d, size_t(layer.cold.down->ne[1])); max_ff = std::max(max_ff, size_t(layer.cold.down->ne[0])); }
+    }
+    auto worker_runtime = llama_tier_runtime_create(256 * (8 * max_ff + 3 * max_d) * sizeof(float) + 96 * 4096, 256 * max_d * sizeof(float));
+    if (const char * directory = std::getenv("CNM_TIER_REMOTE_TABLES")) {
+        auto load = [&](const char * name, size_t count, std::vector<float> & values) {
+            std::ifstream file(std::string(directory) + "/" + name, std::ios::binary | std::ios::ate);
+            if (!file || file.tellg() != std::streamoff(count * sizeof(float))) { throw std::runtime_error("expert remote: invalid SFU table file"); }
+            values.resize(count); file.seekg(0); file.read(reinterpret_cast<char *>(values.data()), count * sizeof(float));
+            if (!file) { throw std::runtime_error("expert remote: SFU table read failed"); }
+        };
+        load("reciprocal-table.f32", size_t(1) << 23, worker_runtime->remote_reciprocal);
+        load("exponential-table.f32", size_t(1) << 24, worker_runtime->remote_exponential);
+        worker_runtime->calibration = hash_sha256_hex(worker_runtime->remote_reciprocal.data(), worker_runtime->remote_reciprocal.size() * sizeof(float)) + hash_sha256_hex(worker_runtime->remote_exponential.data(), worker_runtime->remote_exponential.size() * sizeof(float));
+    }
+    struct gpu_bank {
+        llama_expert_bank * target = nullptr;
+        llama_expert_bank original;
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ~gpu_bank() { if (target) { *target = original; } ggml_backend_buffer_free(buffer); ggml_free(ctx); }
+    };
+    std::vector<std::unique_ptr<gpu_bank>> gpu_banks;
+    size_t gpu_remaining = 0;
+    if (const char * budget = std::getenv("CNM_TIER_REMOTE_GPU_BYTES")) {
+        std::string value(budget);
+        if (value.empty() || !std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; })) { throw std::runtime_error("expert remote: invalid GPU budget"); }
+        gpu_remaining = std::stoull(value);
+    }
+    auto * gpu = gpu_remaining ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : nullptr;
+    if (gpu_remaining && (!gpu || std::string(ggml_backend_dev_name(gpu)).find("CUDA") != 0)) { throw std::runtime_error("expert remote: CUDA GPU budget requested but CUDA unavailable"); }
     std::map<std::string, worker_layer> layers;
     for (size_t i = 0; i < model.expert_tiers.size(); ++i) {
-        const auto & layer = model.expert_tiers[i]; if (!layer.cold.down) { continue; }
-        const size_t d = layer.cold.down->ne[1], ff = layer.cold.down->ne[0];
+        auto & layer = model.expert_tiers[i]; if (!layer.cold.down) { continue; }
         auto & w = layers[layer.cold.down->name];
-        w.runtime = llama_tier_runtime_create(256 * (8 * ff + 3 * d) * sizeof(float) + 96 * 4096, 256 * d * sizeof(float));
+        w.runtime = worker_runtime;
         w.dispatch = std::make_unique<llama_tier_dispatch>(layer, model.hparams.swiglu_clamp_exp[i], model.arch == LLM_ARCH_GLM5_NEXT, threads, nullptr, w.runtime);
-        w.dispatch->bank_identity();
+        const auto identity = w.dispatch->bank_identity();
+        size_t payload = 0;
+        for (auto * weight : {layer.cold.gate, layer.cold.up, layer.cold.gate_up, layer.cold.down}) { if (weight) { payload += ggml_nbytes(weight); } }
+        if (gpu && payload <= gpu_remaining) {
+            auto bank = std::make_unique<gpu_bank>(); bank->original = layer.cold;
+            bank->ctx = ggml_init({4 * ggml_tensor_overhead(), nullptr, true}); if (!bank->ctx) { throw std::bad_alloc(); }
+            llama_expert_bank placed = layer.cold;
+            auto clone = [&](ggml_tensor * weight) {
+                if (!weight) { return weight; }
+                auto * tensor = ggml_dup_tensor(bank->ctx, weight); ggml_set_name(tensor, weight->name); return tensor;
+            };
+            placed.gate = clone(placed.gate); placed.up = clone(placed.up); placed.gate_up = clone(placed.gate_up); placed.down = clone(placed.down);
+            bank->buffer = ggml_backend_alloc_ctx_tensors_from_buft(bank->ctx, ggml_backend_dev_buffer_type(gpu));
+            if (!bank->buffer) { throw std::bad_alloc(); }
+            const size_t allocated = ggml_backend_buffer_get_size(bank->buffer);
+            if (allocated <= gpu_remaining) {
+                for (const auto & item : {std::make_pair(layer.cold.gate, placed.gate), std::make_pair(layer.cold.up, placed.up), std::make_pair(layer.cold.gate_up, placed.gate_up), std::make_pair(layer.cold.down, placed.down)}) {
+                    if (item.first) { ggml_backend_tensor_copy(item.first, item.second); }
+                }
+                bank->target = &layer.cold; layer.cold = placed; gpu_remaining -= allocated;
+                worker_runtime->remote_identities[placed.down] = identity;
+                LLAMA_LOG_INFO("expert remote: resident CUDA bank=%s payload_bytes=%zu allocated_bytes=%zu remaining_bytes=%zu\n", placed.down->name, payload, allocated, gpu_remaining);
+                gpu_banks.push_back(std::move(bank));
+            }
+        }
     }
     llama_remote_listen(endpoint, [&](llama_remote_call & c) {
         auto found = layers.find(c.bank);
         if (found == layers.end()) { throw std::runtime_error("expert remote: unknown bank"); }
         auto & dispatch = *found->second.dispatch;
         if (c.identity != dispatch.bank_identity() || c.clamp != dispatch.clamp || c.glm != dispatch.glm || c.d != dispatch.layer.cold.down->ne[1]) { throw std::runtime_error("expert remote: bank payload, placement or policy mismatch"); }
+        dispatch.remote_policy_active = !c.calibration.empty(); dispatch.cuda_arithmetic = dispatch.remote_policy_active;
+        if (dispatch.remote_policy_active) {
+            if (c.calibration != worker_runtime->calibration) { throw std::runtime_error("expert remote: SFU calibration mismatch"); }
+            dispatch.remote_policy = c.policies; dispatch.remote_warps = c.warps;
+            dispatch.reciprocal_table = worker_runtime->remote_reciprocal.data(); dispatch.exponential_table = worker_runtime->remote_exponential.data();
+        } else if (std::any_of(c.policies.begin(), c.policies.end(), [](uint32_t p) { return p != 0; })) { throw std::runtime_error("expert remote: missing numerical calibration"); }
         std::vector<int64_t> pairs(c.pairs.begin(), c.pairs.end()); std::vector<int32_t> local;
         for (auto id : c.ids) {
             const auto & ids = dispatch.layer.cold.ids;
@@ -545,6 +641,14 @@ void llama_tier_remote_serve(llama_model & model, const char * endpoint, int thr
         storage.buffer = ggml_backend_alloc_ctx_tensors_from_buft(storage.ctx, ggml_backend_cpu_buffer_type());
         if (!storage.buffer) { throw std::bad_alloc(); }
         ggml_backend_buffer_clear(storage.buffer, 0);
+        tensors gpu_storage;
+        if (!ggml_backend_buffer_is_host(dispatch.layer.cold.down->buffer)) {
+            gpu_storage.ctx = ggml_init({ggml_tensor_overhead(), nullptr, true}); if (!gpu_storage.ctx) { throw std::bad_alloc(); }
+            auto * staged = ggml_dup_tensor(gpu_storage.ctx, input);
+            gpu_storage.buffer = ggml_backend_alloc_ctx_tensors_from_buft(gpu_storage.ctx, ggml_backend_dev_buffer_type(gpu));
+            if (!gpu_storage.buffer) { throw std::bad_alloc(); }
+            ggml_backend_buffer_clear(gpu_storage.buffer, 0); input = staged; output->src[0] = staged;
+        }
         for (size_t i = 0; i < c.tokens.size(); ++i) { ggml_backend_tensor_set(input, c.input.data() + i * c.d, size_t(c.tokens[i]) * c.d * sizeof(float), c.d * sizeof(float)); }
         auto started = std::chrono::steady_clock::now();
         dispatch.run_bank(dispatch.layer.cold, dispatch.cold, pairs, local, output);

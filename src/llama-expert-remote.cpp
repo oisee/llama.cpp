@@ -19,7 +19,7 @@
 #endif
 
 namespace {
-constexpr uint32_t magic = 0x45504231, version = 1;
+constexpr uint32_t magic = 0x45504231, version = 2;
 constexpr size_t limit = 64 * 1024 * 1024;
 using bytes = std::vector<uint8_t>;
 void require(bool ok, const char * message) {
@@ -138,6 +138,7 @@ void llama_remote_peer::send(llama_remote_call & c) {
     require(c.pairs.size() == c.ids.size() && c.input.size() == size_t(c.d) * c.tokens.size(), "invalid invocation");
     bytes b; string(b, c.bank); string(b, c.identity);
     uint32_t clamp; std::memcpy(&clamp, &c.clamp, 4); u32(b, clamp); u32(b, c.glm);
+    for (auto policy : c.policies) { u32(b, policy); } u32(b, c.warps); string(b, c.calibration);
     for (size_t i = 0; i < c.pairs.size(); ++i) { u32(b, c.pairs[i]); u32(b, c.ids[i]); }
     for (auto t : c.tokens) { u32(b, t); } floats(b, c.input); send_frame(fd, c, 1, std::move(b));
 #else
@@ -184,6 +185,8 @@ void llama_remote_listen(const std::string & endpoint, const std::function<void(
         size_t p = 0; c.bank = read_string(b, p); c.identity = read_string(b, p);
         uint32_t clamp = read32(b, p); std::memcpy(&c.clamp, &clamp, 4);
         const uint32_t glm = read32(b, p); require(glm <= 1, "invalid architecture policy"); c.glm = glm;
+        for (auto & policy : c.policies) { policy = read32(b, p); require(policy <= 2, "invalid numerical policy"); }
+        c.warps = read32(b, p); require(c.warps == 1 || c.warps == 4, "invalid MMVQ warp policy"); c.calibration = read_string(b, p);
         c.ids.resize(c.pairs.size()); std::vector<uint8_t> seen(size_t(c.t) * c.k, 0), tokens(c.t, 0);
         for (size_t i = 0; i < c.pairs.size(); ++i) {
             c.pairs[i] = read32(b, p); c.ids[i] = read32(b, p);
