@@ -442,6 +442,7 @@ jobs:
         with:
           name: llama-bin-win-cpu-${{ matrix.arch }}.zip
           path: cpu-package
+          skip-decompress: true
 
       - name: Pack complete CUDA artifacts
         shell: pwsh
