@@ -544,8 +544,17 @@ ggml_tensor * llama_tier_dispatch_build(llama_tier_dispatch & dispatch, ggml_con
 
 void llama_tier_remote_serve(llama_model & model, const char * endpoint, int threads) {
     if (std::getenv("CNM_TIER_REMOTE") || std::getenv("CNM_TIER_CUDA_ARITH")) { throw std::runtime_error("expert remote: worker requires local CPU arithmetic"); }
+    struct request_tensors {
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ~request_tensors() { reset(); }
+        void reset() { ggml_backend_buffer_free(buffer); ggml_free(ctx); buffer = nullptr; ctx = nullptr; }
+    };
     struct worker_layer {
         std::shared_ptr<llama_tier_runtime> runtime;
+        request_tensors storage, gpu_storage;
+        ggml_tensor * input = nullptr;
+        ggml_tensor * output = nullptr;
         std::unique_ptr<llama_tier_dispatch> dispatch;
     };
     size_t max_d = 0, max_ff = 0;
@@ -615,9 +624,12 @@ void llama_tier_remote_serve(llama_model & model, const char * endpoint, int thr
     llama_remote_listen(endpoint, [&](llama_remote_call & c) {
         auto found = layers.find(c.bank);
         if (found == layers.end()) { throw std::runtime_error("expert remote: unknown bank"); }
-        auto & dispatch = *found->second.dispatch;
+        auto & state = found->second;
+        auto & dispatch = *state.dispatch;
         if (c.identity != dispatch.bank_identity() || c.clamp != dispatch.clamp || c.glm != dispatch.glm || c.d != dispatch.layer.cold.down->ne[1]) { throw std::runtime_error("expert remote: bank payload, placement or policy mismatch"); }
-        dispatch.remote_policy_active = !c.calibration.empty(); dispatch.cuda_arithmetic = dispatch.remote_policy_active;
+        const bool exact = !c.calibration.empty();
+        if (exact != dispatch.remote_policy_active || c.policies != dispatch.remote_policy || int(c.warps) != dispatch.remote_warps) { dispatch.cold.clear(); }
+        dispatch.remote_policy_active = exact; dispatch.cuda_arithmetic = exact;
         if (dispatch.remote_policy_active) {
             if (c.calibration != worker_runtime->calibration) { throw std::runtime_error("expert remote: SFU calibration mismatch"); }
             dispatch.remote_policy = c.policies; dispatch.remote_warps = c.warps;
@@ -630,32 +642,30 @@ void llama_tier_remote_serve(llama_model & model, const char * endpoint, int thr
             if (at == ids.end()) { throw std::runtime_error("expert remote: selected expert absent"); }
             local.push_back(at - ids.begin());
         }
-        struct tensors {
-            ggml_context * ctx = nullptr; ggml_backend_buffer_t buffer = nullptr;
-            ~tensors() { ggml_backend_buffer_free(buffer); ggml_free(ctx); }
-        } storage;
-        storage.ctx = ggml_init({4 * ggml_tensor_overhead(), nullptr, true});
-        if (!storage.ctx) { throw std::bad_alloc(); }
-        auto * input = ggml_new_tensor_2d(storage.ctx, GGML_TYPE_F32, c.d, c.t);
-        auto * output = ggml_new_tensor_3d(storage.ctx, GGML_TYPE_F32, c.d, c.k, c.t); output->src[0] = input;
-        storage.buffer = ggml_backend_alloc_ctx_tensors_from_buft(storage.ctx, ggml_backend_cpu_buffer_type());
-        if (!storage.buffer) { throw std::bad_alloc(); }
-        ggml_backend_buffer_clear(storage.buffer, 0);
-        tensors gpu_storage;
-        if (!ggml_backend_buffer_is_host(dispatch.layer.cold.down->buffer)) {
-            gpu_storage.ctx = ggml_init({ggml_tensor_overhead(), nullptr, true}); if (!gpu_storage.ctx) { throw std::bad_alloc(); }
-            auto * staged = ggml_dup_tensor(gpu_storage.ctx, input);
-            gpu_storage.buffer = ggml_backend_alloc_ctx_tensors_from_buft(gpu_storage.ctx, ggml_backend_dev_buffer_type(gpu));
-            if (!gpu_storage.buffer) { throw std::bad_alloc(); }
-            ggml_backend_buffer_clear(gpu_storage.buffer, 0); input = staged; output->src[0] = staged;
+        if (!state.output || state.output->ne[0] != c.d || state.output->ne[1] != c.k || state.output->ne[2] != c.t) {
+            dispatch.cold.clear(); state.gpu_storage.reset(); state.storage.reset();
+            auto & storage = state.storage;
+            storage.ctx = ggml_init({4 * ggml_tensor_overhead(), nullptr, true});
+            if (!storage.ctx) { throw std::bad_alloc(); }
+            state.input = ggml_new_tensor_2d(storage.ctx, GGML_TYPE_F32, c.d, c.t);
+            state.output = ggml_new_tensor_3d(storage.ctx, GGML_TYPE_F32, c.d, c.k, c.t); state.output->src[0] = state.input;
+            storage.buffer = ggml_backend_alloc_ctx_tensors_from_buft(storage.ctx, ggml_backend_cpu_buffer_type());
+            if (!storage.buffer) { throw std::bad_alloc(); }
+            if (!ggml_backend_buffer_is_host(dispatch.layer.cold.down->buffer)) {
+                auto & gpu_storage = state.gpu_storage;
+                gpu_storage.ctx = ggml_init({ggml_tensor_overhead(), nullptr, true}); if (!gpu_storage.ctx) { throw std::bad_alloc(); }
+                auto * staged = ggml_dup_tensor(gpu_storage.ctx, state.input);
+                gpu_storage.buffer = ggml_backend_alloc_ctx_tensors_from_buft(gpu_storage.ctx, ggml_backend_dev_buffer_type(gpu));
+                if (!gpu_storage.buffer) { throw std::bad_alloc(); }
+                state.input = staged; state.output->src[0] = staged;
+            }
         }
+        auto * input = state.input; auto * output = state.output;
         for (size_t i = 0; i < c.tokens.size(); ++i) { ggml_backend_tensor_set(input, c.input.data() + i * c.d, size_t(c.tokens[i]) * c.d * sizeof(float), c.d * sizeof(float)); }
         auto started = std::chrono::steady_clock::now();
         dispatch.run_bank(dispatch.layer.cold, dispatch.cold, pairs, local, output);
         c.compute_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
         c.output.resize(size_t(c.d) * pairs.size());
         for (size_t i = 0; i < pairs.size(); ++i) { ggml_backend_tensor_get(output, c.output.data() + i * c.d, size_t(pairs[i]) * c.d * sizeof(float), c.d * sizeof(float)); }
-        // Graphs reference this request's source metadata.
-        dispatch.cold.clear();
     });
 }
