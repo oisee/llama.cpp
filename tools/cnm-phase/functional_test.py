@@ -170,6 +170,10 @@ try:
     rq = urllib.request.Request(f"http://{HOST}:{PORT + 1}/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(rq, timeout=600) as f:
         pr = json.loads(f.read())
+    for _ in range(50):  # the proxy writes its log line after the response is sent
+        if plog.exists() and plog.read_text().strip():
+            break
+        time.sleep(0.1)
     rec = json.loads(plog.read_text().splitlines()[-1])
     s_after = call("/cnm/stats")[1]
     gate("G7_proxy_switches_profile", rec.get("phase") == "edit" and s_after.get("profile") == "edit" and "choices" in pr,
