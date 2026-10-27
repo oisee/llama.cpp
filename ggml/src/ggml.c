@@ -89,6 +89,7 @@ uint64_t ggml_graph_next_uid(void) {
 #include <sys/wait.h>
 #if defined(__linux__)
 #include <sys/prctl.h>
+#include <sys/mman.h>
 #endif
 
 #if defined(__ANDROID__)
@@ -342,9 +343,16 @@ void ggml_log_callback_default(enum ggml_log_level level, const char * text, voi
 
 void * ggml_aligned_malloc(size_t size) {
 #if defined(__s390x__)
-    const int alignment = 256;
+    int alignment = 256;
 #else
-    const int alignment = 64;
+    int alignment = 64;
+#endif
+
+#if defined(__linux__) && !defined(GGML_USE_CPU_HBM) && defined(MADV_HUGEPAGE)
+    const size_t hugepage_size = 2 * 1024 * 1024;
+    const char * hugepage_env = getenv("CNM_MADV_HUGEPAGE");
+    const bool hugepages = size >= hugepage_size && hugepage_env && strcmp(hugepage_env, "1") == 0;
+    if (hugepages) { alignment = (int) hugepage_size; }
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -392,6 +400,12 @@ void * ggml_aligned_malloc(size_t size) {
         GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
         return NULL;
     }
+#if defined(__linux__) && !defined(GGML_USE_CPU_HBM) && defined(MADV_HUGEPAGE)
+    // Advise only whole pages owned by this allocation, before the first write.
+    if (hugepages && madvise(aligned_memory, size - size % hugepage_size, MADV_HUGEPAGE) != 0) {
+        GGML_LOG_WARN("%s: MADV_HUGEPAGE failed: %s\n", __func__, strerror(errno));
+    }
+#endif
     return aligned_memory;
 #endif
 }
