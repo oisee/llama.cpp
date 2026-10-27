@@ -1,5 +1,6 @@
 #pragma once
 #include "ggml-backend.h"
+#include "llama.h"
 #include <memory>
 
 struct llama_expert_tiers;
@@ -9,3 +10,5 @@ std::shared_ptr<llama_tier_runtime> llama_tier_runtime_create(size_t bytes, size
 
 std::shared_ptr<llama_tier_dispatch> llama_tier_dispatch_create(const llama_expert_tiers & layer, float clamp, bool glm, int threads, ggml_backend_dev_t layer_device, std::shared_ptr<llama_tier_runtime> runtime);
 ggml_tensor * llama_tier_dispatch_build(llama_tier_dispatch & dispatch, ggml_context * ctx, ggml_tensor * input, ggml_tensor * ids);
+
+LLAMA_API void llama_tier_remote_serve(llama_model & model, const char * endpoint, int threads);
