@@ -1,6 +1,7 @@
 #include "quantize.cuh"
 #include <cstdint>
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static __global__ void tier_reciprocal_table(float * values) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     const float x = __uint_as_float(0x3f800000u + i);
@@ -46,6 +47,7 @@ void ggml_cuda_tier_exponential_table(float * host) {
     }
     CUDA_CHECK(cudaFree(device));
 }
+#endif
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
 // this maps to 256-bit loads in PTX on supported devices,

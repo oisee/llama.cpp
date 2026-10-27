@@ -5402,6 +5402,11 @@ struct ggml_backend_cuda_device_context {
 
 // Model-independent instruction tables, shared by contexts on the same Turing device.
 static const float * ggml_backend_cuda_tier_sfu_table(ggml_backend_dev_t dev, bool exponential) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    GGML_UNUSED(exponential);
+    return nullptr;
+#else
     auto * ctx = static_cast<ggml_backend_cuda_device_context *>(dev->context);
     if (ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_TURING) { return nullptr; }
     static std::mutex mutex;
@@ -5417,6 +5422,7 @@ static const float * ggml_backend_cuda_tier_sfu_table(ggml_backend_dev_t dev, bo
         ggml_cuda_set_device(previous);
     }
     return values.data();
+#endif
 }
 
 static const float * ggml_backend_cuda_tier_reciprocal(ggml_backend_dev_t dev) {
