@@ -150,7 +150,7 @@ struct llama_tier_dispatch {
                 auto ex2 = reinterpret_cast<table_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_tier_exponential"));
                 reciprocal_table = rcp ? rcp(layer_device) : nullptr;
                 exponential_table = ex2 ? ex2(layer_device) : nullptr;
-                if (!reciprocal_table || !exponential_table) { throw std::runtime_error("expert tiers: SFU policy requires Turing CUDA"); }
+                if (!reciprocal_table || !exponential_table) { throw std::runtime_error("expert tiers: SFU policy requires a qualified CUDA device"); }
                 break;
             }
         }
