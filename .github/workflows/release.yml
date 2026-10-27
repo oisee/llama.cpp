@@ -9,7 +9,7 @@ on:
         type: boolean
   push:
     branches:
-      - master
+      - cnm/release-v0.1
     paths: [
       '.github/workflows/release.yml',
       '**/CMakeLists.txt',
@@ -60,7 +60,7 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "should_release=true" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/master" ]]; then
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/cnm/release-v0.1" ]]; then
             if echo "$COMMIT_MESSAGE" | grep -q '\[no release\]'; then
               echo "should_release=false" >> $GITHUB_OUTPUT
             else
@@ -570,8 +570,6 @@ jobs:
         with:
           key: release-windows-2022-${{ matrix.arch }}-cuda-${{ matrix.cuda }}
 
-  # note: builds only the ggml-sycl backend - llama-server is injected from the
-  #       windows-cpu zip during the release "Merge artifacts" step
   ui-build:
     needs: [check-release]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
