@@ -1,0 +1,127 @@
+# cnm-serve: Windows x64 llama-server with Vulkan for the cnm-serve AMD / integrated-GPU kit.
+# Modelled on the windows-cpu job and the windows (backend: vulkan, arch: x64) job of release.yml at f3269ef96, and
+# merged the way the upstream release does it: llama-server.exe and the CPU backends come from the clang build,
+# ggml-vulkan.dll from the Vulkan SDK build. Same engine commit and bias patch as the CUDA kit (the bias loader is
+# unused by the Vulkan kit and harmless). No vendor runtime DLLs: the Vulkan loader (vulkan-1.dll) ships with every
+# AMD / Intel / NVIDIA Windows driver.
+name: cnm-serve windows vulkan
+
+on:
+  workflow_dispatch:
+  # workflow_dispatch only works once the file is on the default branch, which this fork keeps upstream's;
+  # so a push to the kit branch builds it
+  push:
+    branches: ["cnm/serve-*-vulkan"]
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON"
+  VULKAN_VERSION: 1.4.357.0 # as release.yml at f3269ef96
+
+jobs:
+  windows-cpu:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # build number / version from git, as release.yml
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
+            %CMAKE_ARGS%
+          cmake --build build --config Release
+
+      - name: Check the bias loader is in the binary
+        shell: pwsh
+        run: |
+          $hit = Select-String -Path .\build\bin\Release\llama.dll -Pattern 'CNM_EXPERT_BIAS_MODEL' -SimpleMatch -Quiet
+          if (-not $hit) { throw "llama.dll does not contain the CNM_EXPERT_BIAS loader" }
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-cpu-x64
+          path: build/bin/Release/*
+
+  windows-vulkan:
+    runs-on: windows-2025
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_CPU=OFF -DGGML_BACKEND_DL=ON -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release --target ggml-vulkan
+
+      - name: Collect ggml-vulkan
+        shell: pwsh
+        run: |
+          $dst = New-Item -ItemType Directory -Force out
+          Copy-Item .\build\bin\Release\ggml-vulkan.dll $dst
+          if (-not (Test-Path (Join-Path $dst "ggml-vulkan.dll"))) { throw "missing ggml-vulkan.dll" }
+          Get-ChildItem $dst | Format-Table Name, Length
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-vulkan-x64
+          path: out/*
+
+  package:
+    needs: [windows-cpu, windows-vulkan]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download
+        uses: actions/download-artifact@v8
+        with:
+          path: parts
+
+      - name: Merge into llama/
+        run: |
+          set -euo pipefail
+          mkdir -p llama
+          cp parts/win-cpu-x64/* llama/
+          cp parts/win-vulkan-x64/* llama/
+          for f in llama-server.exe llama.dll ggml.dll ggml-base.dll ggml-vulkan.dll; do
+            test -s "llama/$f" || { echo "missing llama/$f"; exit 1; }
+          done
+          ls llama/ggml-cpu-*.dll >/dev/null
+          grep -q CNM_EXPERT_BIAS_MODEL llama/llama.dll
+          echo "${GITHUB_SHA}" > llama/BUILD-COMMIT.txt
+          (cd llama && sha256sum * > ../SHA256SUMS-llama.txt)
+          cat SHA256SUMS-llama.txt
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: cnm-serve-llama-win64-vulkan
+          path: |
+            llama/
+            SHA256SUMS-llama.txt
