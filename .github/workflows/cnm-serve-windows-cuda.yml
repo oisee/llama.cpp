@@ -9,6 +9,10 @@ name: cnm-serve windows cuda
 
 on:
   workflow_dispatch:
+  # workflow_dispatch only works once the file is on the default branch, which this fork keeps upstream's;
+  # so a push to the kit branch builds it
+  push:
+    branches: [cnm/serve-v0.3]
 
 permissions:
   contents: read
