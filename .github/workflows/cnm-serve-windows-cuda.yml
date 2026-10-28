@@ -1,0 +1,135 @@
+# cnm-serve: Windows x64 llama-server with CUDA 12.4 for the cnm-serve kit.
+# Modelled on the windows-cpu and windows-cuda jobs of release.yml at f3269ef96 and merged the same way the upstream
+# release does it: llama-server.exe and the CPU backends come from the clang build, ggml-cuda.dll and the CUDA
+# runtime from the MSVC + CUDA build.
+# CUDA 12.4: runs on Windows 10 and 11 with driver >= 528.33 (minor-version compatibility; the 12.4 toolkit driver is
+# 551.61), i.e. any current Game Ready / Studio driver. Real SASS for sm_75 (RTX 20), sm_86 (RTX 30), sm_89 (RTX 40);
+# PTX compute_89 for newer cards (JIT-compiled by the driver on first start).
+name: cnm-serve windows cuda
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON"
+  CUDA_ARCHS: "75-real;86-real;89-real;89-virtual"
+
+jobs:
+  windows-cpu:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
+            %CMAKE_ARGS%
+          cmake --build build --config Release
+
+      - name: Check the bias loader is in the binary
+        shell: pwsh
+        run: |
+          $hit = Select-String -Path .\build\bin\Release\llama.dll -Pattern 'CNM_EXPERT_BIAS_MODEL' -SimpleMatch -Quiet
+          if (-not $hit) { throw "llama.dll does not contain the CNM_EXPERT_BIAS loader" }
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-cpu-x64
+          path: build/bin/Release/*
+
+  windows-cuda:
+    runs-on: windows-2022
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="%CUDA_ARCHS%" ^
+            -DLLAMA_BUILD_BORINGSSL=ON -DGGML_CUDA_CCCL_VERSION=v3.4.3
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Collect ggml-cuda and the CUDA runtime
+        shell: pwsh
+        run: |
+          $dst = New-Item -ItemType Directory -Force out
+          Copy-Item .\build\bin\Release\ggml-cuda.dll $dst
+          foreach ($d in "bin", "bin\x64", "lib") {
+            $src = Join-Path $env:CUDA_PATH $d
+            if (Test-Path $src) { Get-ChildItem $src -Include cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll -Recurse -Depth 0 | Copy-Item -Destination $dst }
+          }
+          foreach ($f in "ggml-cuda.dll", "cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll") {
+            if (-not (Test-Path (Join-Path $dst $f))) { throw "missing $f" }
+          }
+          Get-ChildItem $dst | Format-Table Name, Length
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-cuda-12.4-x64
+          path: out/*
+
+  package:
+    needs: [windows-cpu, windows-cuda]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download
+        uses: actions/download-artifact@v8
+        with:
+          path: parts
+
+      - name: Merge into llama/
+        run: |
+          set -euo pipefail
+          mkdir -p llama
+          cp parts/win-cpu-x64/* llama/
+          cp parts/win-cuda-12.4-x64/* llama/
+          for f in llama-server.exe llama.dll ggml.dll ggml-base.dll ggml-cuda.dll cudart64_12.dll cublas64_12.dll cublasLt64_12.dll; do
+            test -s "llama/$f" || { echo "missing llama/$f"; exit 1; }
+          done
+          ls llama/ggml-cpu-*.dll >/dev/null
+          (cd llama && sha256sum * > ../SHA256SUMS-llama.txt)
+          echo "${GITHUB_SHA}" > llama/BUILD-COMMIT.txt
+          cat SHA256SUMS-llama.txt
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: cnm-serve-llama-win64-cuda12.4
+          path: |
+            llama/
+            SHA256SUMS-llama.txt
